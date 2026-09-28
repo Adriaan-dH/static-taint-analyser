@@ -1,0 +1,20 @@
+digraph G {
+  node [shape=box];
+
+  111669149697 [label="METHOD\nmain"];
+  25769803777 [label="BLOCK\n[ ... ]"];
+  30064771072 [label="CALL\nsink"];
+  68719476737 [label="IDENTIFIER\ny"];
+  115964116992 [label="PARAMETER\nx"];
+  115964116993 [label="PARAMETER\ny"];
+  128849018881 [label="EXIT"];
+
+  111669149697 -> 25769803777 ;
+  111669149697 -> 115964116992 ;
+  111669149697 -> 115964116993 ;
+  111669149697 -> 128849018881 ;
+  25769803777 -> 30064771072 ;
+  30064771072 -> 68719476737 ;
+  30064771072 -> 128849018881 [label=CFG, color=blue, constraint=false];
+  111669149697 -> 30064771072 [label=CFG, color=blue, constraint=false];
+}
