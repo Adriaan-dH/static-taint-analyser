@@ -281,7 +281,7 @@ class GraphIndexTests(unittest.TestCase):
 
     def test_unknown_ids_fail_for_all_node_queries(self) -> None:
         for query in (
-            self.graph.node, self.graph.ast_children, self.graph.cfg_successors,
+            self.graph.node, self.graph.ast_children, self.graph.ast_parent, self.graph.cfg_successors,
             self.graph.cfg_predecessors, self.graph.containing_method,
             self.graph.method_parameters, self.graph.method_entry, self.graph.method_exit,
         ):
@@ -308,6 +308,12 @@ class GraphIndexTests(unittest.TestCase):
         self.assertEqual(self.graph.cfg_successors(120), (self.graph.node(190),))
         self.assertEqual(self.graph.cfg_successors(101), ())
         self.assertEqual(self.graph.cfg_successors(190), ())
+
+    def test_ast_parent_excludes_cfg_edges_and_handles_roots(self) -> None:
+        self.assertIs(self.graph.ast_parent(120), self.graph.node(110))
+        self.assertIs(self.graph.ast_parent(190), self.graph.node(100))
+        self.assertIs(self.graph.ast_parent(300), self.graph.node(110))
+        self.assertIsNone(self.graph.ast_parent(400))
 
     def test_cfg_predecessors_exclude_ast_edges(self) -> None:
         self.assertEqual(

@@ -33,6 +33,7 @@ class ProgramGraph:
     edges: list[GraphEdge]
     _nodes_by_id: dict[int, GraphNode] = field(init=False, repr=False, compare=False)
     _ast_children: dict[int, tuple[GraphNode, ...]] = field(init=False, repr=False, compare=False)
+    _ast_parents: dict[int, int] = field(init=False, repr=False, compare=False)
     _cfg_successors: dict[int, tuple[GraphNode, ...]] = field(init=False, repr=False, compare=False)
     _cfg_predecessors: dict[int, tuple[GraphNode, ...]] = field(init=False, repr=False, compare=False)
     _methods: tuple[GraphNode, ...] = field(init=False, repr=False, compare=False)
@@ -88,6 +89,7 @@ class ProgramGraph:
             self._method_exits[method.id] = tuple(
                 child for child in children if child.kind == "EXIT"
             )
+        self._ast_parents = ast_parents
         self._index_method_ownership(ast_parents)
 
     def _index_method_ownership(self, ast_parents: dict[int, int]) -> None:
@@ -120,6 +122,12 @@ class ProgramGraph:
         """Return direct AST children in stable ast_order order."""
         self.node(node_id)
         return self._ast_children.get(node_id, ())
+
+    def ast_parent(self, node_id: int) -> GraphNode | None:
+        """Return the direct AST parent, or None for an AST root."""
+        self.node(node_id)
+        parent_id = self._ast_parents.get(node_id)
+        return None if parent_id is None else self.node(parent_id)
 
     def cfg_successors(self, node_id: int) -> tuple[GraphNode, ...]:
         """Return immediate CFG successors in supplied edge order."""
