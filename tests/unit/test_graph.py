@@ -1,4 +1,4 @@
-"""Focused tests for JSON input parsing. No analysis is performed."""
+"""Focused tests for graph parsing and structural indexes. No analysis."""
 
 import json
 import tempfile
@@ -226,6 +226,182 @@ class GraphParsingTests(unittest.TestCase):
                     metadata,
                     TestMetadata(raw_metadata["sourceNode"], raw_metadata["sinkNode"]),
                 )
+
+
+class GraphIndexTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.graph = ProgramGraph(
+            nodes=[
+                GraphNode(100, "METHOD", "outer", 1),
+                GraphNode(102, "PARAMETER", "second", 2),
+                GraphNode(190, "EXIT", "EXIT", 2),
+                GraphNode(110, "BLOCK", "[ ... ]", 1),
+                GraphNode(101, "PARAMETER", "first", 1),
+                GraphNode(120, "CALL", "sink", 2),
+                GraphNode(121, "IDENTIFIER", "first", 1),
+                GraphNode(200, "METHOD", "other", 2),
+                GraphNode(201, "PARAMETER", "x", 1),
+                GraphNode(290, "EXIT", "EXIT", 2),
+                GraphNode(300, "METHOD", "other", 1),
+                GraphNode(310, "BLOCK", "[ ... ]", 1),
+                GraphNode(301, "PARAMETER", "nested", 1),
+                GraphNode(320, "RETURN", "", 1),
+                GraphNode(390, "EXIT", "EXIT", 2),
+                GraphNode(400, "MODULE", "", 0),
+                GraphNode(401, "IDENTIFIER", "outside", 3),
+            ],
+            edges=[
+                GraphEdge(100, 102, "AST"),
+                GraphEdge(100, 190, "AST"),
+                GraphEdge(100, 110, "AST"),
+                GraphEdge(100, 101, "AST"),
+                GraphEdge(110, 120, "AST"),
+                GraphEdge(110, 300, "AST"),
+                GraphEdge(120, 121, "AST"),
+                GraphEdge(200, 201, "AST"),
+                GraphEdge(200, 290, "AST"),
+                GraphEdge(300, 310, "AST"),
+                GraphEdge(300, 301, "AST"),
+                GraphEdge(300, 390, "AST"),
+                GraphEdge(310, 320, "AST"),
+                GraphEdge(400, 100, "AST"),
+                GraphEdge(400, 200, "AST"),
+                GraphEdge(400, 401, "AST"),
+                GraphEdge(100, 120, "CFG"),
+                GraphEdge(120, 190, "CFG"),
+                GraphEdge(100, 190, "CFG"),
+                GraphEdge(200, 290, "CFG"),
+                GraphEdge(300, 320, "CFG"),
+                GraphEdge(320, 390, "CFG"),
+            ],
+        )
+
+    def test_node_lookup_returns_original_node(self) -> None:
+        self.assertIs(self.graph.node(102), self.graph.nodes[1])
+
+    def test_unknown_ids_fail_for_all_node_queries(self) -> None:
+        for query in (
+            self.graph.node, self.graph.ast_children, self.graph.cfg_successors,
+            self.graph.cfg_predecessors, self.graph.containing_method,
+            self.graph.method_parameters, self.graph.method_entry, self.graph.method_exit,
+        ):
+            with self.subTest(query=query.__name__):
+                with self.assertRaisesRegex(KeyError, "Unknown node ID 999"):
+                    query(999)
+
+    def test_ast_children_use_ast_order_and_stable_ties(self) -> None:
+        self.assertEqual(
+            self.graph.ast_children(100),
+            tuple(self.graph.node(i) for i in (110, 101, 102, 190)),
+        )
+        self.assertEqual(
+            self.graph.ast_children(110),
+            (self.graph.node(300), self.graph.node(120)),
+        )
+        self.assertEqual(self.graph.ast_children(190), ())
+
+    def test_cfg_successors_exclude_ast_edges(self) -> None:
+        self.assertEqual(
+            self.graph.cfg_successors(100),
+            (self.graph.node(120), self.graph.node(190)),
+        )
+        self.assertEqual(self.graph.cfg_successors(120), (self.graph.node(190),))
+        self.assertEqual(self.graph.cfg_successors(101), ())
+        self.assertEqual(self.graph.cfg_successors(190), ())
+
+    def test_cfg_predecessors_exclude_ast_edges(self) -> None:
+        self.assertEqual(
+            self.graph.cfg_predecessors(190),
+            (self.graph.node(120), self.graph.node(100)),
+        )
+        self.assertEqual(self.graph.cfg_predecessors(120), (self.graph.node(100),))
+        self.assertEqual(self.graph.cfg_predecessors(121), ())
+        self.assertEqual(self.graph.cfg_predecessors(100), ())
+
+    def test_methods_and_parameters_are_separate_and_ordered(self) -> None:
+        self.assertEqual(self.graph.methods, tuple(self.graph.node(i) for i in (100, 200, 300)))
+        self.assertEqual(
+            self.graph.method_parameters(100),
+            (self.graph.node(101), self.graph.node(102)),
+        )
+        self.assertEqual(self.graph.method_parameters(200), (self.graph.node(201),))
+        self.assertEqual(self.graph.method_parameters(300), (self.graph.node(301),))
+
+    def test_method_entry_and_exit(self) -> None:
+        for method_id, exit_id in ((100, 190), (200, 290), (300, 390)):
+            with self.subTest(method=method_id):
+                self.assertIs(self.graph.method_entry(method_id), self.graph.node(method_id))
+                self.assertIs(self.graph.method_exit(method_id), self.graph.node(exit_id))
+
+    def test_method_queries_reject_other_node_kinds(self) -> None:
+        for query in (self.graph.method_parameters, self.graph.method_entry, self.graph.method_exit):
+            with self.subTest(query=query.__name__):
+                with self.assertRaisesRegex(ValueError, "Node 110 is not a METHOD"):
+                    query(110)
+
+    def test_ownership_follows_ast_and_nested_methods_own_themselves(self) -> None:
+        for method_id, owned_ids in (
+            (100, (100, 101, 102, 110, 120, 121, 190)),
+            (200, (200, 201, 290)),
+            (300, (300, 301, 310, 320, 390)),
+        ):
+            for node_id in owned_ids:
+                with self.subTest(node=node_id):
+                    self.assertIs(self.graph.containing_method(node_id), self.graph.node(method_id))
+        self.assertIsNone(self.graph.containing_method(400))
+        self.assertIsNone(self.graph.containing_method(401))
+
+    def test_partial_method_has_no_parameters_and_exit_query_fails(self) -> None:
+        graph = ProgramGraph([GraphNode(1, "METHOD", "empty", 1)], [])
+        self.assertEqual(graph.method_parameters(1), ())
+        with self.assertRaisesRegex(ValueError, "expected one EXIT child, found 0"):
+            graph.method_exit(1)
+
+    def test_multiple_exit_children_are_not_chosen_silently(self) -> None:
+        graph = ProgramGraph(
+            [GraphNode(1, "METHOD", "f", 1), GraphNode(2, "EXIT", "", 2), GraphNode(3, "EXIT", "", 2)],
+            [GraphEdge(1, 2, "AST"), GraphEdge(1, 3, "AST")],
+        )
+        with self.assertRaisesRegex(ValueError, "expected one EXIT child, found 2"):
+            graph.method_exit(1)
+
+    def test_invalid_graph_structure_fails_clearly(self) -> None:
+        nodes = [GraphNode(i, "BLOCK", "", i) for i in (1, 2, 3)]
+        invalid_graphs = (
+            (nodes + [nodes[0]], [], "Duplicate node ID 1"),
+            (nodes, [GraphEdge(1, 9, "AST")], "unknown node ID 9"),
+            (nodes, [GraphEdge(9, 1, "CFG")], "unknown node ID 9"),
+            (nodes, [GraphEdge(1, 3, "AST"), GraphEdge(2, 3, "AST")], "multiple AST parents"),
+            (nodes, [GraphEdge(1, 2, "AST"), GraphEdge(2, 1, "AST")], "AST contains a cycle"),
+        )
+        for graph_nodes, edges, message in invalid_graphs:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    ProgramGraph(graph_nodes, edges)
+
+    def test_all_supplied_cases_have_consistent_indexes(self) -> None:
+        cases_directory = Path(__file__).resolve().parents[1] / "testcases"
+        for case in sorted(cases_directory.iterdir()):
+            with self.subTest(case=case.name):
+                graph, metadata = load_test_case(case)
+                self.assertTrue(graph.methods)
+                for node in graph.nodes:
+                    self.assertIs(graph.node(node.id), node)
+                    self.assertIn(graph.containing_method(node.id), graph.methods)
+                    children = graph.ast_children(node.id)
+                    self.assertEqual(list(children), sorted(children, key=lambda child: child.ast_order))
+                    for successor in graph.cfg_successors(node.id):
+                        self.assertIn(node, graph.cfg_predecessors(successor.id))
+                for method in graph.methods:
+                    self.assertIs(graph.method_entry(method.id), method)
+                    self.assertTrue(graph.cfg_successors(method.id))
+                    self.assertIn(graph.method_exit(method.id), graph.ast_children(method.id))
+                    self.assertEqual(
+                        graph.method_parameters(method.id),
+                        tuple(child for child in graph.ast_children(method.id) if child.kind == "PARAMETER"),
+                    )
+                self.assertIsNotNone(graph.containing_method(metadata.source_node))
+                self.assertIsNotNone(graph.containing_method(metadata.sink_node))
 
 
 if __name__ == "__main__":

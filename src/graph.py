@@ -1,7 +1,7 @@
-"""Read program graphs and the metadata permitted as analyser input."""
+"""Read and index program graphs and permitted test metadata."""
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeVar
 
@@ -23,10 +23,150 @@ class GraphEdge:
 
 @dataclass
 class ProgramGraph:
-    """Nodes and edges in the order supplied by graph.json."""
+    """Original records with structural indexes built once at construction.
+
+    Treat nodes and edges as read-only after construction. Relationship queries
+    return tuples so callers cannot change the indexes.
+    """
 
     nodes: list[GraphNode]
     edges: list[GraphEdge]
+    _nodes_by_id: dict[int, GraphNode] = field(init=False, repr=False, compare=False)
+    _ast_children: dict[int, tuple[GraphNode, ...]] = field(init=False, repr=False, compare=False)
+    _cfg_successors: dict[int, tuple[GraphNode, ...]] = field(init=False, repr=False, compare=False)
+    _cfg_predecessors: dict[int, tuple[GraphNode, ...]] = field(init=False, repr=False, compare=False)
+    _methods: tuple[GraphNode, ...] = field(init=False, repr=False, compare=False)
+    _method_parameters: dict[int, tuple[GraphNode, ...]] = field(init=False, repr=False, compare=False)
+    _method_exits: dict[int, tuple[GraphNode, ...]] = field(init=False, repr=False, compare=False)
+    _containing_methods: dict[int, GraphNode | None] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._nodes_by_id = {}
+        for node in self.nodes:
+            if node.id in self._nodes_by_id:
+                raise ValueError(f"Duplicate node ID {node.id}")
+            self._nodes_by_id[node.id] = node
+
+        ast_children: dict[int, list[GraphNode]] = {}
+        ast_parents: dict[int, int] = {}
+        cfg_successors: dict[int, list[GraphNode]] = {}
+        cfg_predecessors: dict[int, list[GraphNode]] = {}
+        for edge in self.edges:
+            for node_id in (edge.source, edge.destination):
+                if node_id not in self._nodes_by_id:
+                    raise ValueError(f"{edge.kind} edge references unknown node ID {node_id}")
+            source = self._nodes_by_id[edge.source]
+            destination = self._nodes_by_id[edge.destination]
+            if edge.kind == "AST":
+                if destination.id in ast_parents and ast_parents[destination.id] != source.id:
+                    raise ValueError(f"Node {destination.id} has multiple AST parents")
+                ast_parents[destination.id] = source.id
+                ast_children.setdefault(source.id, []).append(destination)
+            elif edge.kind == "CFG":
+                cfg_successors.setdefault(source.id, []).append(destination)
+                cfg_predecessors.setdefault(destination.id, []).append(source)
+
+        # Python's stable sort preserves edge order when siblings share astOrder.
+        self._ast_children = {
+            node_id: tuple(sorted(children, key=lambda child: child.ast_order))
+            for node_id, children in ast_children.items()
+        }
+        self._cfg_successors = {
+            node_id: tuple(successors) for node_id, successors in cfg_successors.items()
+        }
+        self._cfg_predecessors = {
+            node_id: tuple(predecessors) for node_id, predecessors in cfg_predecessors.items()
+        }
+        self._methods = tuple(node for node in self.nodes if node.kind == "METHOD")
+        self._method_parameters = {}
+        self._method_exits = {}
+        for method in self._methods:
+            children = self._ast_children.get(method.id, ())
+            self._method_parameters[method.id] = tuple(
+                child for child in children if child.kind == "PARAMETER"
+            )
+            self._method_exits[method.id] = tuple(
+                child for child in children if child.kind == "EXIT"
+            )
+        self._index_method_ownership(ast_parents)
+
+    def _index_method_ownership(self, ast_parents: dict[int, int]) -> None:
+        self._containing_methods = {}
+        pending: list[tuple[GraphNode, GraphNode | None]] = [
+            (node, None) for node in self.nodes if node.id not in ast_parents
+        ]
+        while pending:
+            node, method = pending.pop()
+            if node.id in self._containing_methods:
+                continue
+            if node.kind == "METHOD":
+                method = node
+            self._containing_methods[node.id] = method
+            pending.extend(
+                (child, method) for child in self._ast_children.get(node.id, ())
+            )
+        # With one parent per node, anything unreachable from a root is cyclic.
+        if len(self._containing_methods) != len(self.nodes):
+            raise ValueError("AST contains a cycle")
+
+    def node(self, node_id: int) -> GraphNode:
+        """Look up a node, raising KeyError for an unknown ID."""
+        try:
+            return self._nodes_by_id[node_id]
+        except KeyError:
+            raise KeyError(f"Unknown node ID {node_id}") from None
+
+    def ast_children(self, node_id: int) -> tuple[GraphNode, ...]:
+        """Return direct AST children in stable ast_order order."""
+        self.node(node_id)
+        return self._ast_children.get(node_id, ())
+
+    def cfg_successors(self, node_id: int) -> tuple[GraphNode, ...]:
+        """Return immediate CFG successors in supplied edge order."""
+        self.node(node_id)
+        return self._cfg_successors.get(node_id, ())
+
+    def cfg_predecessors(self, node_id: int) -> tuple[GraphNode, ...]:
+        """Return immediate CFG predecessors in supplied edge order."""
+        self.node(node_id)
+        return self._cfg_predecessors.get(node_id, ())
+
+    @property
+    def methods(self) -> tuple[GraphNode, ...]:
+        """All METHOD nodes in supplied node order."""
+        return self._methods
+
+    def _require_method(self, method_id: int) -> GraphNode:
+        method = self.node(method_id)
+        if method.kind != "METHOD":
+            raise ValueError(f"Node {method_id} is not a METHOD")
+        return method
+
+    def method_parameters(self, method_id: int) -> tuple[GraphNode, ...]:
+        """Return direct PARAMETER children in AST order."""
+        self._require_method(method_id)
+        return self._method_parameters[method_id]
+
+    def method_entry(self, method_id: int) -> GraphNode:
+        """The supplied CFG starts at the METHOD node itself."""
+        return self._require_method(method_id)
+
+    def method_exit(self, method_id: int) -> GraphNode:
+        """Return the method's direct EXIT child; require exactly one."""
+        self._require_method(method_id)
+        exits = self._method_exits[method_id]
+        if len(exits) != 1:
+            raise ValueError(f"METHOD {method_id}: expected one EXIT child, found {len(exits)}")
+        return exits[0]
+
+    def containing_method(self, node_id: int) -> GraphNode | None:
+        """Nearest AST METHOD, including self; None outside any method.
+
+        A nested METHOD owns itself and its subtree, rather than belonging to
+        the outer method. CFG edges do not determine ownership.
+        """
+        self.node(node_id)
+        return self._containing_methods[node_id]
 
 
 @dataclass(frozen=True)
