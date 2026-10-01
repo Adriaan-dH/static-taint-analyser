@@ -6,12 +6,33 @@ from src.graph import GraphNode, ProgramGraph, TestMetadata
 from src.state import TaintState
 
 
-def evaluate_scalar_expression(node: GraphNode, state: TaintState) -> bool:
+SCALAR_BINARY_OPERATORS = {"addition", "subtraction", "multiplication", "division"}
+SCALAR_UNARY_OPERATORS = {"unaryPlus", "unaryMinus"}
+SCALAR_OPERATORS = SCALAR_BINARY_OPERATORS | SCALAR_UNARY_OPERATORS
+COMPARISON_OPERATORS = {
+    "equal", "notEqual", "lessThan", "lessThanOrEqual",
+    "greaterThan", "greaterThanOrEqual",
+}
+
+
+def evaluate_scalar_expression(graph: ProgramGraph, node: GraphNode, state: TaintState) -> bool:
     """Evaluate scalar taint only; never execute or evaluate Python values."""
     if node.kind in ("IDENTIFIER", "PARAMETER"):
         return state.is_tainted(node.value)
     if node.kind == "LITERAL":
         return False
+    if node.kind == "OPERATOR" and node.value in SCALAR_OPERATORS | COMPARISON_OPERATORS:
+        operands = graph.ast_children(node.id)
+        expected_count = 1 if node.value in SCALAR_UNARY_OPERATORS else 2
+        if len(operands) != expected_count:
+            raise ValueError(
+                f"Operator {node.id} ({node.value}): expected {expected_count} operands"
+            )
+        # Visit every operand so an unsupported child cannot be hidden by taint.
+        operand_taint = [evaluate_scalar_expression(graph, operand, state) for operand in operands]
+        if node.value in COMPARISON_OPERATORS:
+            return False
+        return any(operand_taint)
     raise NotImplementedError(f"Unsupported scalar expression: {node.kind} {node.value!r}")
 
 
@@ -25,7 +46,7 @@ def transfer(graph: ProgramGraph, node: GraphNode, state: TaintState) -> TaintSt
     target, expression = children
     if target.kind != "IDENTIFIER":
         raise NotImplementedError("Only scalar IDENTIFIER assignment targets are supported")
-    if evaluate_scalar_expression(expression, state):
+    if evaluate_scalar_expression(graph, expression, state):
         return state.taint(target.value)
     return state.clean(target.value)
 
@@ -40,18 +61,24 @@ def _sink_program_point(graph: ProgramGraph, sink: GraphNode, entry: GraphNode) 
             return current
         # An unreachable expression may have no CFG edges. Do not fall back to
         # the method entry and accidentally regard its children as executed.
-        if current.kind in ("CALL", "OPERATOR", "RETURN"):
+        parent = graph.ast_parent(current.id)
+        if current.kind in ("CALL", "RETURN") or (
+            current.kind == "OPERATOR"
+            and (
+                current.value == "assignment"
+                or (parent is not None and parent.kind in ("BLOCK", "CONTROL_STRUCTURE"))
+            )
+        ):
             return current
-        current = graph.ast_parent(current.id)
+        current = parent
     raise ValueError(f"Sink {sink.id} is not contained in a CFG expression")
 
 
 def analyse_intraprocedural(graph: ProgramGraph, metadata: TestMetadata) -> bool:
     """Check a scalar sink in the source parameter's method.
 
-    Only parameter sources and identifier/literal/parameter sinks are supported.
-    Assignment RHS expressions must also be scalar leaves. Calls and control
-    predicates preserve state; their results are not modelled.
+    Only parameter sources and scalar sinks are supported. Calls and control
+    predicates preserve state; their results do not change CFG reachability.
     """
     source = graph.node(metadata.source_node)
     sink = graph.node(metadata.sink_node)
@@ -63,8 +90,10 @@ def analyse_intraprocedural(graph: ProgramGraph, metadata: TestMetadata) -> bool
         raise ValueError("Intraprocedural analysis requires source and sink in the same METHOD")
     if source not in graph.method_parameters(method.id):
         raise NotImplementedError("Only direct method PARAMETER sources are supported")
-    if sink.kind not in ("IDENTIFIER", "LITERAL", "PARAMETER"):
-        raise NotImplementedError(f"Unsupported scalar sink kind: {sink.kind}")
+    if sink.kind not in ("IDENTIFIER", "LITERAL", "PARAMETER", "OPERATOR") or (
+        sink.kind == "OPERATOR" and sink.value not in SCALAR_OPERATORS | COMPARISON_OPERATORS
+    ):
+        raise NotImplementedError(f"Unsupported scalar sink: {sink.kind} {sink.value!r}")
 
     entry = graph.method_entry(method.id)
     entry_state = TaintState().taint(source.value)
@@ -101,4 +130,4 @@ def analyse_intraprocedural(graph: ProgramGraph, metadata: TestMetadata) -> bool
         # A target denotes the assigned value, whereas the RHS uses IN facts.
         if graph.ast_children(sink_point.id)[0] == sink:
             sink_state = out_states[sink_point.id]
-    return evaluate_scalar_expression(sink, sink_state)
+    return evaluate_scalar_expression(graph, sink, sink_state)

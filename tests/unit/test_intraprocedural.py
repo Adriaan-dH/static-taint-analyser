@@ -77,6 +77,13 @@ class IntraproceduralTests(unittest.TestCase):
             GraphEdge(node_id, node_id + 1, "AST"),
         ])
 
+    def add_operands(
+        self, operator_id: int, *operands: tuple[int, str, str, int]
+    ) -> None:
+        for node_id, kind, value, order in operands:
+            self.nodes.append(GraphNode(node_id, kind, value, order))
+            self.edges.append(GraphEdge(operator_id, node_id, "AST"))
+
     def graph_with_cfg(self, connections: list[tuple[int, int]]) -> ProgramGraph:
         return ProgramGraph(
             self.nodes,
@@ -108,6 +115,96 @@ class IntraproceduralTests(unittest.TestCase):
         self.add_assignment(10, "y", "IDENTIFIER", "x")
         self.set_sink_expression("IDENTIFIER", "y")
         self.assertTrue(self.analyse([(1, 10), (10, 7), (7, 5)]))
+
+    def test_binary_operator_taints_from_either_operand(self) -> None:
+        for first, second in (("x", "y"), ("y", "x")):
+            with self.subTest(first=first, second=second):
+                self.add_assignment(10, "z", "OPERATOR", "addition")
+                self.add_operands(12, (13, "IDENTIFIER", first, 1), (14, "IDENTIFIER", second, 2))
+                self.set_sink_expression("IDENTIFIER", "z")
+                self.assertTrue(self.analyse([(1, 10), (10, 7), (7, 5)]))
+                self.setUp()
+
+    def test_binary_operator_with_clean_operands_is_clean(self) -> None:
+        self.add_assignment(10, "z", "OPERATOR", "addition")
+        self.add_operands(12, (13, "IDENTIFIER", "y", 1), (14, "LITERAL", "1", 2))
+        self.set_sink_expression("IDENTIFIER", "z")
+        self.assertFalse(self.analyse([(1, 10), (10, 7), (7, 5)]))
+
+    def test_unary_operator_propagates_taint(self) -> None:
+        self.add_assignment(10, "z", "OPERATOR", "unaryMinus")
+        self.add_operands(12, (13, "IDENTIFIER", "x", 1))
+        self.set_sink_expression("IDENTIFIER", "z")
+        self.assertTrue(self.analyse([(1, 10), (10, 7), (7, 5)]))
+
+    def test_nested_operators_evaluate_recursively(self) -> None:
+        for inner_variable, expected in (("x", True), ("y", False)):
+            with self.subTest(inner_variable=inner_variable):
+                self.add_assignment(10, "z", "OPERATOR", "multiplication")
+                self.add_operands(12, (13, "OPERATOR", "addition", 1), (14, "LITERAL", "2", 2))
+                self.add_operands(13, (15, "IDENTIFIER", inner_variable, 1), (16, "LITERAL", "1", 2))
+                self.set_sink_expression("IDENTIFIER", "z")
+                self.assertEqual(self.analyse([(1, 10), (10, 7), (7, 5)]), expected)
+                self.setUp()
+
+    def test_deeply_nested_operators(self) -> None:
+        self.add_assignment(10, "z", "OPERATOR", "multiplication")
+        self.add_operands(12, (13, "OPERATOR", "subtraction", 1), (14, "LITERAL", "2", 2))
+        self.add_operands(13, (15, "OPERATOR", "unaryMinus", 1), (16, "LITERAL", "1", 2))
+        self.add_operands(15, (17, "OPERATOR", "addition", 1))
+        self.add_operands(17, (18, "IDENTIFIER", "x", 1), (19, "LITERAL", "1", 2))
+        self.set_sink_expression("IDENTIFIER", "z")
+        self.assertTrue(self.analyse([(1, 10), (10, 7), (7, 5)]))
+
+    def test_operator_ast_order_is_used_despite_edge_and_node_order(self) -> None:
+        self.add_assignment(10, "z", "OPERATOR", "subtraction")
+        self.add_operands(12, (14, "LITERAL", "1", 2), (13, "IDENTIFIER", "x", 1))
+        self.nodes.reverse()
+        graph = self.graph_with_cfg([(1, 10), (10, 7), (7, 5)])
+        self.assertEqual(tuple(child.id for child in graph.ast_children(12)), (13, 14))
+        self.assertTrue(analyse_intraprocedural(graph, TestMetadata(2, 12)))
+
+    def test_comparison_results_are_clean(self) -> None:
+        for operator in (
+            "greaterThan", "lessThan", "greaterThanOrEqual",
+            "lessThanOrEqual", "equal", "notEqual",
+        ):
+            with self.subTest(operator=operator):
+                self.add_assignment(10, "z", "OPERATOR", operator)
+                self.add_operands(12, (13, "IDENTIFIER", "x", 1), (14, "LITERAL", "0", 2))
+                self.set_sink_expression("IDENTIFIER", "z")
+                self.assertFalse(self.analyse([(1, 10), (10, 7), (7, 5)]))
+                self.setUp()
+
+    def test_comparison_overwrites_tainted_target_with_clean_result(self) -> None:
+        self.add_assignment(10, "y", "IDENTIFIER", "x")
+        self.add_assignment(20, "y", "OPERATOR", "greaterThan")
+        self.add_operands(22, (23, "IDENTIFIER", "x", 1), (24, "LITERAL", "0", 2))
+        self.set_sink_expression("IDENTIFIER", "y")
+        self.assertFalse(self.analyse([(1, 10), (10, 20), (20, 7), (7, 5)]))
+
+    def test_operator_expression_can_be_designated_sink(self) -> None:
+        for operator, expected in (("addition", True), ("addition", False), ("greaterThan", False)):
+            with self.subTest(operator=operator, expected=expected):
+                self.set_sink_expression("OPERATOR", operator)
+                variable = "x" if expected or operator == "greaterThan" else "y"
+                self.add_operands(8, (9, "IDENTIFIER", variable, 1), (10, "LITERAL", "1", 2))
+                self.assertEqual(self.analyse([(1, 7), (7, 5)]), expected)
+                self.setUp()
+
+    def test_nested_operator_rhs_sink_uses_pre_assignment_state(self) -> None:
+        self.add_assignment(10, "x", "OPERATOR", "addition")
+        self.add_operands(12, (13, "IDENTIFIER", "x", 1), (14, "LITERAL", "1", 2))
+        self.assertTrue(self.analyse([(1, 10), (10, 5)], sink_id=12))
+
+    def test_comparison_predicate_does_not_prune_cfg_branches(self) -> None:
+        self.nodes.append(GraphNode(30, "OPERATOR", "greaterThan", 1))
+        self.edges.append(GraphEdge(6, 30, "AST"))
+        self.add_operands(30, (31, "IDENTIFIER", "x", 1), (32, "LITERAL", "0", 2))
+        self.add_assignment(10, "y", "IDENTIFIER", "x")
+        self.add_assignment(20, "y", "LITERAL", "0")
+        self.set_sink_expression("IDENTIFIER", "y")
+        self.assertTrue(self.analyse([(1, 30), (30, 10), (30, 20), (10, 7), (20, 7), (7, 5)]))
 
     def test_literal_overwrite_removes_taint(self) -> None:
         self.add_assignment(10, "x", "LITERAL", '"clean"')
@@ -207,7 +304,7 @@ class IntraproceduralTests(unittest.TestCase):
             analyse_intraprocedural(self.graph_with_cfg([(1, 7)]), TestMetadata(8, 8))
 
     def test_unsupported_assignment_rhs_is_not_assumed_clean(self) -> None:
-        for kind, value in (("CALL", "foo"), ("OPERATOR", "addition"), ("LIST", "[]")):
+        for kind, value in (("CALL", "foo"), ("OPERATOR", "unknown"), ("LIST", "[]")):
             with self.subTest(kind=kind):
                 nodes = self.nodes + [
                     GraphNode(10, "OPERATOR", "assignment", 1),
@@ -221,11 +318,37 @@ class IntraproceduralTests(unittest.TestCase):
                 with self.assertRaisesRegex(NotImplementedError, "Unsupported scalar expression"):
                     analyse_intraprocedural(ProgramGraph(nodes, edges), TestMetadata(2, 8))
 
+    def test_unsupported_nested_operand_is_not_hidden_by_taint_or_comparison(self) -> None:
+        for operator in ("addition", "greaterThan"):
+            with self.subTest(operator=operator):
+                self.add_assignment(10, "z", "OPERATOR", operator)
+                self.add_operands(12, (13, "IDENTIFIER", "x", 1), (14, "CALL", "foo", 2))
+                with self.assertRaisesRegex(NotImplementedError, "Unsupported scalar expression"):
+                    self.analyse([(1, 10), (10, 7), (7, 5)])
+                self.setUp()
+
+    def test_malformed_scalar_operator_is_rejected(self) -> None:
+        self.add_assignment(10, "z", "OPERATOR", "addition")
+        self.add_operands(12, (13, "IDENTIFIER", "x", 1))
+        with self.assertRaisesRegex(ValueError, "expected 2 operands"):
+            self.analyse([(1, 10), (10, 7), (7, 5)])
+
+    def test_assignment_itself_is_not_a_scalar_sink(self) -> None:
+        self.add_assignment(10, "z", "IDENTIFIER", "x")
+        with self.assertRaisesRegex(NotImplementedError, "Unsupported scalar sink"):
+            self.analyse([(1, 10), (10, 5)], sink_id=10)
+
     def test_scalar_expression_evaluation(self) -> None:
         state = TaintState().taint("x")
-        self.assertTrue(evaluate_scalar_expression(GraphNode(1, "IDENTIFIER", "x", 1), state))
-        self.assertFalse(evaluate_scalar_expression(GraphNode(2, "IDENTIFIER", "y", 1), state))
-        self.assertFalse(evaluate_scalar_expression(GraphNode(3, "LITERAL", "x", 1), state))
+        nodes = [
+            GraphNode(1, "IDENTIFIER", "x", 1),
+            GraphNode(2, "IDENTIFIER", "y", 1),
+            GraphNode(3, "LITERAL", "x", 1),
+        ]
+        graph = ProgramGraph(nodes, [])
+        self.assertTrue(evaluate_scalar_expression(graph, nodes[0], state))
+        self.assertFalse(evaluate_scalar_expression(graph, nodes[1], state))
+        self.assertFalse(evaluate_scalar_expression(graph, nodes[2], state))
 
     def test_five_supplied_intraprocedural_cases(self) -> None:
         cases_directory = Path(__file__).resolve().parents[1] / "testcases"
