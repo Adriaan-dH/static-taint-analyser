@@ -357,6 +357,135 @@ class IntraproceduralTests(unittest.TestCase):
                 graph, metadata = load_test_case(cases_directory / case)
                 self.assertEqual(analyse_intraprocedural(graph, metadata), expected)
 
+    def test_additional_arithmetic_and_bitwise_operators(self) -> None:
+        for operator in (
+            "modulo", "floorDiv", "exponentiation", "and", "or", "xor",
+            "shiftLeft", "arithmeticShiftRight",
+        ):
+            for first, second, expected in (("x", "y", True), ("y", "x", True), ("y", "y", False)):
+                with self.subTest(operator=operator, first=first, second=second):
+                    self.setUp()
+                    self.add_assignment(10, "z", "OPERATOR", operator)
+                    self.add_operands(12, (13, "IDENTIFIER", first, 1), (14, "IDENTIFIER", second, 2))
+                    self.set_sink_expression("IDENTIFIER", "z")
+                    self.assertEqual(self.analyse([(1, 10), (10, 7), (7, 5)]), expected)
+
+    def test_bitwise_invert_propagates_taint(self) -> None:
+        self.set_sink_expression("OPERATOR", "not")
+        self.add_operands(8, (9, "IDENTIFIER", "x", 1))
+        self.assertTrue(self.analyse([(1, 7), (7, 5)]))
+
+    def test_actual_builder_comparison_spellings_are_clean(self) -> None:
+        for operator in (
+            "equals", "notEquals", "lessEqualsThan", "greaterEqualsThan",
+            "is", "isNot", "in", "notIn",
+        ):
+            with self.subTest(operator=operator):
+                self.setUp()
+                self.set_sink_expression("OPERATOR", operator)
+                self.add_operands(8, (9, "IDENTIFIER", "x", 1), (10, "LITERAL", "0", 2))
+                self.assertFalse(self.analyse([(1, 7), (7, 5)]))
+
+    def test_logical_results_follow_clean_boolean_abstraction(self) -> None:
+        for operator in ("logicalAnd", "logicalOr", "logicalNot"):
+            with self.subTest(operator=operator):
+                self.setUp()
+                self.set_sink_expression("OPERATOR", operator)
+                operands = [(9, "IDENTIFIER", "x", 1)]
+                if operator != "logicalNot":
+                    operands.extend([(10, "IDENTIFIER", "y", 2), (11, "IDENTIFIER", "x", 3)])
+                self.add_operands(8, *operands)
+                self.assertFalse(self.analyse([(1, 7), (7, 5)]))
+
+    def test_logical_operator_validates_every_operand(self) -> None:
+        self.set_sink_expression("OPERATOR", "logicalAnd")
+        self.add_operands(8, (9, "IDENTIFIER", "x", 1), (10, "CALL", "foo", 2))
+        with self.assertRaisesRegex(NotImplementedError, "Unsupported expression"):
+            self.analyse([(1, 7), (7, 5)])
+
+    def test_malformed_logical_operator_is_rejected(self) -> None:
+        self.set_sink_expression("OPERATOR", "logicalOr")
+        self.add_operands(8, (9, "IDENTIFIER", "x", 1))
+        with self.assertRaisesRegex(ValueError, "at least 2 operands"):
+            self.analyse([(1, 7), (7, 5)])
+
+    def test_augmented_scalar_assignments_propagate_both_old_value_and_rhs(self) -> None:
+        for operator in (
+            "assignmentPlus", "assignmentMinus", "assignmentMultiplication", "assignmentDivision",
+            "assignmentFloorDiv", "assignmentModulo", "assignmentExponentiation", "assignmentAnd",
+            "assignmentOr", "assignmentXor", "assignmentShiftLeft", "assignmentArithmeticShiftRight",
+        ):
+            for target, rhs, expected in (("y", "x", True), ("x", "y", True), ("y", "y", False)):
+                with self.subTest(operator=operator, target=target, rhs=rhs):
+                    self.setUp()
+                    self.add_assignment(10, target, "IDENTIFIER", rhs)
+                    self.nodes = [
+                        GraphNode(n.id, n.kind, operator, n.ast_order) if n.id == 10 else n
+                        for n in self.nodes
+                    ]
+                    self.set_sink_expression("IDENTIFIER", target)
+                    self.assertEqual(self.analyse([(1, 10), (10, 7), (7, 5)]), expected)
+
+    def test_augmented_target_and_rhs_sink_timing(self) -> None:
+        self.add_assignment(10, "y", "IDENTIFIER", "x")
+        self.nodes = [
+            GraphNode(n.id, n.kind, "assignmentPlus", n.ast_order) if n.id == 10 else n
+            for n in self.nodes
+        ]
+        connections = [(1, 10), (10, 5)]
+        self.assertTrue(self.analyse(connections, 11))
+        self.assertTrue(self.analyse(connections, 12))
+
+    def test_unknown_statement_operator_does_not_silently_preserve_clean_state(self) -> None:
+        self.nodes.append(GraphNode(10, "OPERATOR", "assignmentUnknown", 1))
+        self.edges.append(GraphEdge(4, 10, "AST"))
+        with self.assertRaisesRegex(NotImplementedError, "Unsupported expression"):
+            self.analyse([(1, 10), (10, 7), (7, 5)])
+
+    def test_ignored_statement_call_preserves_local_facts(self) -> None:
+        self.nodes.append(GraphNode(10, "CALL", "foo", 1))
+        self.edges.append(GraphEdge(4, 10, "AST"))
+        self.assertTrue(self.analyse([(1, 10), (10, 7), (7, 5)]))
+
+    def test_call_result_sink_is_explicitly_unsupported(self) -> None:
+        self.set_sink_expression("CALL", "foo")
+        with self.assertRaisesRegex(NotImplementedError, "Unsupported sink"):
+            self.analyse([(1, 7), (7, 5)])
+
+    def test_nested_definition_event_does_not_enter_callee(self) -> None:
+        self.add_assignment(10, "inner", "METHOD_REF", "inner")
+        self.nodes.extend([
+            GraphNode(20, "METHOD", "inner", 3),
+            GraphNode(21, "PARAMETER", "x", 1),
+            GraphNode(22, "EXIT", "EXIT", 2),
+        ])
+        self.edges.extend([GraphEdge(4, 20, "AST"), GraphEdge(20, 21, "AST"), GraphEdge(20, 22, "AST")])
+        self.assertTrue(self.analyse([(1, 12), (12, 10), (10, 7), (7, 5), (20, 22)]))
+
+    def test_return_endpoint_keeps_following_sink_unreachable(self) -> None:
+        self.nodes.append(GraphNode(10, "RETURN", "RETURN", 1))
+        self.edges.append(GraphEdge(4, 10, "AST"))
+        self.assertFalse(self.analyse([(1, 10), (10, 5)]))
+
+    def test_sink_expression_inside_return_uses_local_state(self) -> None:
+        self.nodes.append(GraphNode(10, "RETURN", "RETURN", 1))
+        self.edges.remove(GraphEdge(4, 7, "AST"))
+        self.edges.extend([GraphEdge(4, 10, "AST"), GraphEdge(10, 7, "AST")])
+        self.assertTrue(self.analyse([(1, 7), (7, 10), (10, 5)]))
+
+    def test_lowered_expression_block_returns_last_expression_without_replaying_writes(self) -> None:
+        self.add_assignment(10, "x", "LITERAL", "0")
+        self.set_sink_expression("BLOCK", "[ ... ]")
+        self.add_operands(8, (20, "OPERATOR", "assignment", 1), (30, "IDENTIFIER", "y", 2))
+        self.add_operands(20, (21, "IDENTIFIER", "y", 1), (22, "IDENTIFIER", "x", 2))
+        self.assertTrue(self.analyse([(1, 20), (20, 10), (10, 7), (7, 5)]))
+
+    def test_expression_block_validates_earlier_unsupported_expression(self) -> None:
+        self.set_sink_expression("BLOCK", "[ ... ]")
+        self.add_operands(8, (9, "CALL", "foo", 1), (10, "LITERAL", "0", 2))
+        with self.assertRaisesRegex(NotImplementedError, "Unsupported expression"):
+            self.analyse([(1, 7), (7, 5)])
+
 
 class ListIntraproceduralTests(unittest.TestCase):
     """Small ASTs use the builder's operators and expression-level CFG order.
@@ -662,6 +791,34 @@ class ListIntraproceduralTests(unittest.TestCase):
         self.assign("a", [0, "x"])
         self.assertTrue(self.analyse(("indexAccess", "a", ("addition", 0, 0))))
 
+    def test_bitwise_invert_index_is_not_mistaken_for_a_positive_literal(self) -> None:
+        self.assign("a", ["x", 0])
+        self.assertTrue(self.analyse(("indexAccess", "a", ("not", 1))))
+
+    def test_conditional_list_values_union_references_without_condition_taint(self) -> None:
+        self.assign("first", ["x"])
+        self.assign("second", [0])
+        self.assign("a", ("conditional", "x", "first", "second"))
+        self.assign(("indexAccess", "a", 0), 0)
+        self.assertTrue(self.analyse(("indexAccess", "first", 0)))
+
+    def test_clean_conditional_alternatives_ignore_predicate_taint(self) -> None:
+        self.assign("a", ("conditional", "x", 0, 1))
+        self.assertFalse(self.analyse("a"))
+
+    def test_augmented_list_cell_assignment_updates_shared_memory(self) -> None:
+        self.assign("a", [0])
+        statement = self.assign(("indexAccess", "a", 0), "x")
+        self.nodes = [
+            GraphNode(n.id, n.kind, "assignmentPlus", n.ast_order) if n.id == statement else n
+            for n in self.nodes
+        ]
+        self.assertTrue(self.analyse(("indexAccess", "a", 0)))
+
+    def test_logical_comparison_list_element_is_clean(self) -> None:
+        self.assign("a", [("logicalAnd", ("lessThan", "x", 0), ("lessThan", 0, 1))])
+        self.assertFalse(self.analyse(("indexAccess", "a", 0)))
+
     def test_reference_valued_element_preserves_alias(self) -> None:
         self.assign("inner", [0])
         self.assign("outer", ["inner"])
@@ -756,6 +913,8 @@ class ListIntraproceduralTests(unittest.TestCase):
         self.assign("a", ["x"])
         with self.assertRaisesRegex(NotImplementedError, "Unsupported sink"):
             self.analyse(("slice", "a", 0, 1, 1))
+        self.setUp()
+        self.assign("a", ["x"])
         with self.assertRaisesRegex(NotImplementedError, "List arithmetic"):
             self.analyse(("addition", "a", "a"))
 

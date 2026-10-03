@@ -7,20 +7,38 @@ from src.graph import GraphNode, ProgramGraph, TestMetadata
 from src.state import AbstractValue, CLEAN_SCALAR, TaintState
 
 
-SCALAR_BINARY_OPERATORS = {"addition", "subtraction", "multiplication", "division"}
-SCALAR_UNARY_OPERATORS = {"unaryPlus", "unaryMinus", "plus", "minus"}
+SCALAR_BINARY_OPERATORS = {
+    "addition", "subtraction", "multiplication", "division", "floorDiv",
+    "modulo", "exponentiation", "and", "or", "xor", "shiftLeft", "arithmeticShiftRight",
+}
+SIGN_OPERATORS = {"unaryPlus", "unaryMinus", "plus", "minus"}
+SCALAR_UNARY_OPERATORS = SIGN_OPERATORS | {"not"}
 SCALAR_OPERATORS = SCALAR_BINARY_OPERATORS | SCALAR_UNARY_OPERATORS
 COMPARISON_OPERATORS = {
     "equal", "notEqual", "lessThan", "lessThanOrEqual",
     "greaterThan", "greaterThanOrEqual",
+    "equals", "notEquals", "lessEqualsThan", "greaterEqualsThan",
+    "is", "isNot", "in", "notIn",
 }
+LOGICAL_OPERATORS = {"logicalAnd", "logicalOr", "logicalNot"}
+BOOLEAN_OPERATORS = COMPARISON_OPERATORS | LOGICAL_OPERATORS
+EXPRESSION_OPERATORS = SCALAR_OPERATORS | BOOLEAN_OPERATORS | {
+    "listLiteral", "indexAccess", "conditional",
+}
+AUGMENTED_ASSIGNMENTS = {
+    "assignmentPlus", "assignmentMinus", "assignmentMultiplication", "assignmentDivision",
+    "assignmentFloorDiv", "assignmentModulo", "assignmentExponentiation", "assignmentAnd",
+    "assignmentOr", "assignmentXor", "assignmentShiftLeft", "assignmentArithmeticShiftRight",
+}
+ASSIGNMENT_OPERATORS = {"assignment"} | AUGMENTED_ASSIGNMENTS
+NO_EFFECT_OPERATORS = {"pass"}
 
 
 def abstract_index(graph: ProgramGraph, node: GraphNode) -> int | None:
     """Recognise integer syntax only; all other expressions denote any index."""
     if node.kind == "LITERAL" and re.fullmatch(r"[0-9]+", node.value):
         return int(node.value)
-    if node.kind == "OPERATOR" and node.value in SCALAR_UNARY_OPERATORS:
+    if node.kind == "OPERATOR" and node.value in SIGN_OPERATORS:
         children = graph.ast_children(node.id)
         if len(children) == 1 and children[0].kind == "LITERAL":
             index = abstract_index(graph, children[0])
@@ -52,6 +70,22 @@ def evaluate_expression(graph: ProgramGraph, node: GraphNode, state: TaintState)
         return state.value(node.value)
     if node.kind == "LITERAL":
         return CLEAN_SCALAR
+    if node.kind == "BLOCK":
+        children = graph.ast_children(node.id)
+        if not children:
+            raise NotImplementedError("Empty expression BLOCK is not supported")
+        result = AbstractValue()
+        for child in children:
+            # Chained comparisons are lowered to temporary assignments followed
+            # by a result expression. The CFG already performed those writes.
+            if child.kind == "OPERATOR" and child.value == "assignment":
+                operands = graph.ast_children(child.id)
+                if len(operands) != 2:
+                    raise ValueError(f"Assignment {child.id}: expected target and RHS children")
+                result = evaluate_expression(graph, operands[1], state)
+            else:
+                result = evaluate_expression(graph, child, state)
+        return result
     if node.kind == "OPERATOR" and node.value == "listLiteral":
         return AbstractValue(list_objects=frozenset({node.id}))
     if node.kind == "OPERATOR" and node.value == "indexAccess":
@@ -62,23 +96,43 @@ def evaluate_expression(graph: ProgramGraph, node: GraphNode, state: TaintState)
         for object_id in targets.list_objects:
             result = result.join(state.list_memory(object_id).read(index))
         return result
-    if node.kind == "OPERATOR" and node.value in SCALAR_OPERATORS | COMPARISON_OPERATORS:
+    if node.kind == "OPERATOR" and node.value == "conditional":
+        children = graph.ast_children(node.id)
+        if len(children) != 3:
+            raise ValueError(f"Conditional {node.id}: expected condition and two alternatives")
+        evaluate_expression(graph, children[0], state)
+        # Like an if/else assignment, both value alternatives are reachable;
+        # the predicate does not introduce implicit control-flow taint.
+        return evaluate_expression(graph, children[1], state).join(
+            evaluate_expression(graph, children[2], state)
+        )
+    if node.kind == "OPERATOR" and node.value in SCALAR_OPERATORS | BOOLEAN_OPERATORS:
         operands = graph.ast_children(node.id)
-        expected_count = 1 if node.value in SCALAR_UNARY_OPERATORS else 2
+        if node.value in {"logicalAnd", "logicalOr"}:
+            if len(operands) < 2:
+                raise ValueError(f"Operator {node.id} ({node.value}): expected at least 2 operands")
+            expected_count = len(operands)
+        else:
+            expected_count = 1 if node.value in SCALAR_UNARY_OPERATORS | {"logicalNot"} else 2
         if len(operands) != expected_count:
             raise ValueError(
                 f"Operator {node.id} ({node.value}): expected {expected_count} operands"
             )
         # Visit every operand so an unsupported child cannot be hidden by taint.
         values = [evaluate_expression(graph, operand, state) for operand in operands]
-        if node.value in COMPARISON_OPERATORS:
+        if node.value in BOOLEAN_OPERATORS:
+            # Follow the assignment's Boolean abstraction, also for and/or.
             return CLEAN_SCALAR
-        if any(value.list_objects for value in values):
-            raise NotImplementedError("List arithmetic is not supported")
-        return AbstractValue(
-            scalar_tainted=any(value.scalar_tainted for value in values), may_be_scalar=True
-        )
+        return _scalar_operator_value(values)
     raise NotImplementedError(f"Unsupported expression: {node.kind} {node.value!r}")
+
+
+def _scalar_operator_value(values: list[AbstractValue]) -> AbstractValue:
+    if any(value.list_objects for value in values):
+        raise NotImplementedError("List arithmetic is not supported")
+    return AbstractValue(
+        scalar_tainted=any(value.scalar_tainted for value in values), may_be_scalar=True
+    )
 
 
 def _prepare_lists(
@@ -129,14 +183,24 @@ def transfer(graph: ProgramGraph, node: GraphNode, state: TaintState) -> TaintSt
         for child in graph.ast_children(node.id):
             state = _prepare_lists(graph, child, state)
         return _allocate_list(graph, node, state)
-    if node.kind != "OPERATOR" or node.value != "assignment":
+    if node.kind != "OPERATOR":
+        return state
+    if node.value not in ASSIGNMENT_OPERATORS:
+        if node.value not in EXPRESSION_OPERATORS | NO_EFFECT_OPERATORS:
+            raise NotImplementedError(f"Unsupported expression: {node.kind} {node.value!r}")
         return state
     children = graph.ast_children(node.id)
     if len(children) != 2:
         raise ValueError(f"Assignment {node.id}: expected target and RHS children")
     target, expression = children
+    if expression.kind == "METHOD_REF" and node.value == "assignment":
+        # A nested definition is a local CFG event. Callable bindings and the
+        # nested body belong to Part 2 and are deliberately not modelled here.
+        return state
     state = _prepare_lists(graph, expression, state, refresh_unsequenced=True)
     value = evaluate_expression(graph, expression, state)
+    if node.value in AUGMENTED_ASSIGNMENTS:
+        value = _scalar_operator_value([evaluate_expression(graph, target, state), value])
     if target.kind == "IDENTIFIER":
         return state.bind(target.value, value)
     if target.kind == "OPERATOR" and target.value == "indexAccess":
@@ -150,7 +214,7 @@ def _sink_program_point(graph: ProgramGraph, sink: GraphNode, entry: GraphNode) 
     if sink.kind == "PARAMETER":
         return entry
     parent = graph.ast_parent(sink.id)
-    if parent is not None and parent.kind == "OPERATOR" and parent.value == "assignment":
+    if parent is not None and parent.kind == "OPERATOR" and parent.value in ASSIGNMENT_OPERATORS:
         if graph.ast_children(parent.id)[0] == sink:
             return parent
     current: GraphNode | None = sink
@@ -163,7 +227,7 @@ def _sink_program_point(graph: ProgramGraph, sink: GraphNode, entry: GraphNode) 
         if current.kind in ("CALL", "RETURN") or (
             current.kind == "OPERATOR"
             and (
-                current.value == "assignment"
+                current.value in ASSIGNMENT_OPERATORS
                 or (parent is not None and parent.kind in ("BLOCK", "CONTROL_STRUCTURE"))
             )
         ):
@@ -188,9 +252,9 @@ def analyse_intraprocedural(graph: ProgramGraph, metadata: TestMetadata) -> bool
         raise ValueError("Intraprocedural analysis requires source and sink in the same METHOD")
     if source not in graph.method_parameters(method.id):
         raise NotImplementedError("Only direct method PARAMETER sources are supported")
-    if sink.kind not in ("IDENTIFIER", "LITERAL", "PARAMETER", "OPERATOR") or (
+    if sink.kind not in ("IDENTIFIER", "LITERAL", "PARAMETER", "OPERATOR", "BLOCK") or (
         sink.kind == "OPERATOR"
-        and sink.value not in SCALAR_OPERATORS | COMPARISON_OPERATORS | {"listLiteral", "indexAccess"}
+        and sink.value not in EXPRESSION_OPERATORS
     ):
         raise NotImplementedError(f"Unsupported sink: {sink.kind} {sink.value!r}")
 
@@ -230,7 +294,7 @@ def analyse_intraprocedural(graph: ProgramGraph, metadata: TestMetadata) -> bool
     sink_state = in_states[sink_point.id]
     if sink_point == sink and sink.kind == "OPERATOR" and sink.value == "listLiteral":
         sink_state = out_states[sink_point.id]
-    if sink_point.kind == "OPERATOR" and sink_point.value == "assignment":
+    if sink_point.kind == "OPERATOR" and sink_point.value in ASSIGNMENT_OPERATORS:
         # A target denotes the assigned value, whereas the RHS uses IN facts.
         if graph.ast_children(sink_point.id)[0] == sink:
             sink_state = out_states[sink_point.id]

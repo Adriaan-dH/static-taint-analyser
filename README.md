@@ -23,10 +23,10 @@ graph, metadata = load_test_case("tests/testcases/test1")
 
 The loader reads `graph.json` and `test_case.json`, preserving node IDs,
 `astOrder` (as `ast_order`), and edge kinds. Metadata contains only
-`source_node` and `sink_node`; `reaches` is ignored. No taint analysis is
-implemented yet.
+`source_node` and `sink_node`; `reaches` is ignored. Intraprocedural taint
+analysis supports scalar operators, list memory, and aliases.
 
-Run the parsing tests from the repository root:
+Run the unit tests from the repository root:
 
 ```bash
 python3 -B -m unittest discover -s tests/unit -v
