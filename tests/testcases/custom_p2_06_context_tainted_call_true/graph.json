@@ -1,0 +1,256 @@
+{
+   "nodes": [
+      {
+         "id": 111669149697,
+         "kind": "METHOD",
+         "value": "identity",
+         "astOrder": 1
+      },
+      {
+         "id": 25769803777,
+         "kind": "BLOCK",
+         "value": "[ ... ]",
+         "astOrder": 1
+      },
+      {
+         "id": 146028888064,
+         "kind": "RETURN",
+         "value": "RETURN",
+         "astOrder": 1
+      },
+      {
+         "id": 68719476737,
+         "kind": "IDENTIFIER",
+         "value": "v",
+         "astOrder": 1
+      },
+      {
+         "id": 115964116992,
+         "kind": "PARAMETER",
+         "value": "v",
+         "astOrder": 1
+      },
+      {
+         "id": 128849018881,
+         "kind": "EXIT",
+         "value": "EXIT",
+         "astOrder": 2
+      },
+      {
+         "id": 111669149698,
+         "kind": "METHOD",
+         "value": "main",
+         "astOrder": 3
+      },
+      {
+         "id": 25769803778,
+         "kind": "BLOCK",
+         "value": "[ ... ]",
+         "astOrder": 1
+      },
+      {
+         "id": 30064771074,
+         "kind": "OPERATOR",
+         "value": "assignment",
+         "astOrder": 1
+      },
+      {
+         "id": 68719476741,
+         "kind": "IDENTIFIER",
+         "value": "a",
+         "astOrder": 1
+      },
+      {
+         "id": 30064771073,
+         "kind": "CALL",
+         "value": "identity",
+         "astOrder": 2
+      },
+      {
+         "id": 68719476739,
+         "kind": "IDENTIFIER",
+         "value": "x",
+         "astOrder": 1
+      },
+      {
+         "id": 30064771076,
+         "kind": "OPERATOR",
+         "value": "assignment",
+         "astOrder": 2
+      },
+      {
+         "id": 68719476743,
+         "kind": "IDENTIFIER",
+         "value": "b",
+         "astOrder": 1
+      },
+      {
+         "id": 30064771075,
+         "kind": "CALL",
+         "value": "identity",
+         "astOrder": 2
+      },
+      {
+         "id": 90194313216,
+         "kind": "LITERAL",
+         "value": "0",
+         "astOrder": 1
+      },
+      {
+         "id": 30064771077,
+         "kind": "CALL",
+         "value": "sink",
+         "astOrder": 3
+      },
+      {
+         "id": 68719476744,
+         "kind": "IDENTIFIER",
+         "value": "a",
+         "astOrder": 1
+      },
+      {
+         "id": 115964116993,
+         "kind": "PARAMETER",
+         "value": "x",
+         "astOrder": 1
+      },
+      {
+         "id": 128849018882,
+         "kind": "EXIT",
+         "value": "EXIT",
+         "astOrder": 2
+      }
+   ],
+   "edges": [
+      {
+         "source": 111669149697,
+         "destination": 25769803777,
+         "kind": "AST"
+      },
+      {
+         "source": 111669149697,
+         "destination": 115964116992,
+         "kind": "AST"
+      },
+      {
+         "source": 111669149697,
+         "destination": 128849018881,
+         "kind": "AST"
+      },
+      {
+         "source": 25769803777,
+         "destination": 146028888064,
+         "kind": "AST"
+      },
+      {
+         "source": 146028888064,
+         "destination": 68719476737,
+         "kind": "AST"
+      },
+      {
+         "source": 146028888064,
+         "destination": 128849018881,
+         "kind": "CFG"
+      },
+      {
+         "source": 111669149697,
+         "destination": 146028888064,
+         "kind": "CFG"
+      },
+      {
+         "source": 111669149698,
+         "destination": 25769803778,
+         "kind": "AST"
+      },
+      {
+         "source": 111669149698,
+         "destination": 115964116993,
+         "kind": "AST"
+      },
+      {
+         "source": 111669149698,
+         "destination": 128849018882,
+         "kind": "AST"
+      },
+      {
+         "source": 25769803778,
+         "destination": 30064771074,
+         "kind": "AST"
+      },
+      {
+         "source": 25769803778,
+         "destination": 30064771076,
+         "kind": "AST"
+      },
+      {
+         "source": 25769803778,
+         "destination": 30064771077,
+         "kind": "AST"
+      },
+      {
+         "source": 30064771074,
+         "destination": 68719476741,
+         "kind": "AST"
+      },
+      {
+         "source": 30064771074,
+         "destination": 30064771073,
+         "kind": "AST"
+      },
+      {
+         "source": 30064771073,
+         "destination": 68719476739,
+         "kind": "AST"
+      },
+      {
+         "source": 30064771076,
+         "destination": 68719476743,
+         "kind": "AST"
+      },
+      {
+         "source": 30064771076,
+         "destination": 30064771075,
+         "kind": "AST"
+      },
+      {
+         "source": 30064771075,
+         "destination": 90194313216,
+         "kind": "AST"
+      },
+      {
+         "source": 30064771077,
+         "destination": 68719476744,
+         "kind": "AST"
+      },
+      {
+         "source": 30064771074,
+         "destination": 30064771075,
+         "kind": "CFG"
+      },
+      {
+         "source": 30064771076,
+         "destination": 30064771077,
+         "kind": "CFG"
+      },
+      {
+         "source": 30064771077,
+         "destination": 128849018882,
+         "kind": "CFG"
+      },
+      {
+         "source": 30064771073,
+         "destination": 30064771074,
+         "kind": "CFG"
+      },
+      {
+         "source": 30064771075,
+         "destination": 30064771076,
+         "kind": "CFG"
+      },
+      {
+         "source": 111669149698,
+         "destination": 30064771073,
+         "kind": "CFG"
+      }
+   ]
+}

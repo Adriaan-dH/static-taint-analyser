@@ -1,0 +1,41 @@
+digraph G {
+  node [shape=box];
+
+  111669149697 [label="METHOD\nidentity"];
+  25769803777 [label="BLOCK\n[ ... ]"];
+  146028888064 [label="RETURN"];
+  68719476737 [label="IDENTIFIER\nv"];
+  115964116992 [label="PARAMETER\nv"];
+  128849018881 [label="EXIT"];
+  111669149698 [label="METHOD\nmain"];
+  25769803778 [label="BLOCK\n[ ... ]"];
+  30064771074 [label="OPERATOR\nassignment"];
+  68719476741 [label="IDENTIFIER\ny"];
+  30064771073 [label="CALL\nidentity"];
+  68719476739 [label="IDENTIFIER\nx"];
+  30064771075 [label="CALL\nsink"];
+  68719476742 [label="IDENTIFIER\ny"];
+  115964116993 [label="PARAMETER\nx"];
+  128849018882 [label="EXIT"];
+
+  111669149697 -> 25769803777 ;
+  111669149697 -> 115964116992 ;
+  111669149697 -> 128849018881 ;
+  25769803777 -> 146028888064 ;
+  146028888064 -> 68719476737 ;
+  146028888064 -> 128849018881 [label=CFG, color=blue, constraint=false];
+  111669149697 -> 146028888064 [label=CFG, color=blue, constraint=false];
+  111669149698 -> 25769803778 ;
+  111669149698 -> 115964116993 ;
+  111669149698 -> 128849018882 ;
+  25769803778 -> 30064771074 ;
+  25769803778 -> 30064771075 ;
+  30064771074 -> 68719476741 ;
+  30064771074 -> 30064771073 ;
+  30064771073 -> 68719476739 ;
+  30064771075 -> 68719476742 ;
+  30064771074 -> 30064771075 [label=CFG, color=blue, constraint=false];
+  30064771075 -> 128849018882 [label=CFG, color=blue, constraint=false];
+  30064771073 -> 30064771074 [label=CFG, color=blue, constraint=false];
+  111669149698 -> 30064771073 [label=CFG, color=blue, constraint=false];
+}
