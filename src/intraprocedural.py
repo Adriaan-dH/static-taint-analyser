@@ -1,6 +1,7 @@
 """Forward scalar and list taint analysis within one method, without calls."""
 
 from collections import deque
+from collections.abc import Mapping
 import re
 
 from src.graph import GraphNode, ProgramGraph, TestMetadata
@@ -54,18 +55,26 @@ def _index_operands(graph: ProgramGraph, node: GraphNode) -> tuple[GraphNode, Gr
     return children[0], children[1]
 
 
-def _list_targets(graph: ProgramGraph, node: GraphNode, state: TaintState) -> AbstractValue:
+def _list_targets(
+    graph: ProgramGraph, node: GraphNode, state: TaintState,
+    call_values: Mapping[int, AbstractValue] | None = None,
+) -> AbstractValue:
     base, index = _index_operands(graph, node)
-    targets = evaluate_expression(graph, base, state)
+    targets = evaluate_expression(graph, base, state, call_values=call_values)
     # Validate the index, but its taint never influences a load or store.
-    evaluate_expression(graph, index, state)
+    evaluate_expression(graph, index, state, call_values=call_values)
     if not targets.list_objects:
         raise NotImplementedError("Index access requires a modelled list reference")
     return targets
 
 
-def evaluate_expression(graph: ProgramGraph, node: GraphNode, state: TaintState) -> AbstractValue:
+def evaluate_expression(
+    graph: ProgramGraph, node: GraphNode, state: TaintState,
+    call_values: Mapping[int, AbstractValue] | None = None,
+) -> AbstractValue:
     """Read values and references without executing Python or mutating state."""
+    if node.kind == "CALL" and call_values is not None and node.id in call_values:
+        return call_values[node.id]
     if node.kind in ("IDENTIFIER", "PARAMETER"):
         return state.value(node.value)
     if node.kind == "LITERAL":
@@ -82,14 +91,14 @@ def evaluate_expression(graph: ProgramGraph, node: GraphNode, state: TaintState)
                 operands = graph.ast_children(child.id)
                 if len(operands) != 2:
                     raise ValueError(f"Assignment {child.id}: expected target and RHS children")
-                result = evaluate_expression(graph, operands[1], state)
+                result = evaluate_expression(graph, operands[1], state, call_values=call_values)
             else:
-                result = evaluate_expression(graph, child, state)
+                result = evaluate_expression(graph, child, state, call_values=call_values)
         return result
     if node.kind == "OPERATOR" and node.value == "listLiteral":
         return AbstractValue(list_objects=frozenset({node.id}))
     if node.kind == "OPERATOR" and node.value == "indexAccess":
-        targets = _list_targets(graph, node, state)
+        targets = _list_targets(graph, node, state, call_values=call_values)
         _, index_node = _index_operands(graph, node)
         index = abstract_index(graph, index_node)
         result = AbstractValue()
@@ -100,11 +109,11 @@ def evaluate_expression(graph: ProgramGraph, node: GraphNode, state: TaintState)
         children = graph.ast_children(node.id)
         if len(children) != 3:
             raise ValueError(f"Conditional {node.id}: expected condition and two alternatives")
-        evaluate_expression(graph, children[0], state)
+        evaluate_expression(graph, children[0], state, call_values=call_values)
         # Like an if/else assignment, both value alternatives are reachable;
         # the predicate does not introduce implicit control-flow taint.
-        return evaluate_expression(graph, children[1], state).join(
-            evaluate_expression(graph, children[2], state)
+        return evaluate_expression(graph, children[1], state, call_values=call_values).join(
+            evaluate_expression(graph, children[2], state, call_values=call_values)
         )
     if node.kind == "OPERATOR" and node.value in SCALAR_OPERATORS | BOOLEAN_OPERATORS:
         operands = graph.ast_children(node.id)
@@ -119,7 +128,10 @@ def evaluate_expression(graph: ProgramGraph, node: GraphNode, state: TaintState)
                 f"Operator {node.id} ({node.value}): expected {expected_count} operands"
             )
         # Visit every operand so an unsupported child cannot be hidden by taint.
-        values = [evaluate_expression(graph, operand, state) for operand in operands]
+        values = [
+            evaluate_expression(graph, operand, state, call_values=call_values)
+            for operand in operands
+        ]
         if node.value in BOOLEAN_OPERATORS:
             # Follow the assignment's Boolean abstraction, also for and/or.
             return CLEAN_SCALAR
@@ -136,7 +148,8 @@ def _scalar_operator_value(values: list[AbstractValue]) -> AbstractValue:
 
 
 def _prepare_lists(
-    graph: ProgramGraph, node: GraphNode, state: TaintState, refresh_unsequenced: bool = False
+    graph: ProgramGraph, node: GraphNode, state: TaintState, refresh_unsequenced: bool = False,
+    call_values: Mapping[int, AbstractValue] | None = None,
 ) -> TaintState:
     """Initialise literals omitted from a synthetic CFG, or used as a sink.
 
@@ -144,29 +157,39 @@ def _prepare_lists(
     Reading that expression must reuse the object, not allocate it a second time.
     """
     for child in graph.ast_children(node.id):
-        state = _prepare_lists(graph, child, state, refresh_unsequenced)
+        state = _prepare_lists(graph, child, state, refresh_unsequenced, call_values)
     if node.kind == "OPERATOR" and node.value == "listLiteral":
         sequenced = graph.cfg_predecessors(node.id) or graph.cfg_successors(node.id)
         if node.id not in dict(state.lists) or (refresh_unsequenced and not sequenced):
-            state = _allocate_list(graph, node, state)
+            state = _allocate_list(graph, node, state, call_values=call_values)
     return state
 
 
-def _allocate_list(graph: ProgramGraph, node: GraphNode, state: TaintState) -> TaintState:
-    elements = tuple(evaluate_expression(graph, child, state) for child in graph.ast_children(node.id))
+def _allocate_list(
+    graph: ProgramGraph, node: GraphNode, state: TaintState,
+    call_values: Mapping[int, AbstractValue] | None = None,
+) -> TaintState:
+    elements = tuple(
+        evaluate_expression(graph, child, state, call_values=call_values)
+        for child in graph.ast_children(node.id)
+    )
     return state.allocate(node.id, elements)
 
 
-def evaluate_scalar_expression(graph: ProgramGraph, node: GraphNode, state: TaintState) -> bool:
+def evaluate_scalar_expression(
+    graph: ProgramGraph, node: GraphNode, state: TaintState,
+    call_values: Mapping[int, AbstractValue] | None = None,
+) -> bool:
     """Compatibility taint query, also observing the contents of list values."""
-    state = _prepare_lists(graph, node, state)
-    return state.value_is_tainted(evaluate_expression(graph, node, state))
+    state = _prepare_lists(graph, node, state, call_values=call_values)
+    return state.value_is_tainted(evaluate_expression(graph, node, state, call_values=call_values))
 
 
 def _write_list(
-    graph: ProgramGraph, target: GraphNode, value: AbstractValue, state: TaintState
+    graph: ProgramGraph, target: GraphNode, value: AbstractValue, state: TaintState,
+    call_values: Mapping[int, AbstractValue] | None = None,
 ) -> TaintState:
-    targets = _list_targets(graph, target, state)
+    targets = _list_targets(graph, target, state, call_values=call_values)
     _, index_node = _index_operands(graph, target)
     index = abstract_index(graph, index_node)
     definite_object = len(targets.list_objects) == 1 and not targets.may_be_scalar
@@ -177,12 +200,15 @@ def _write_list(
     return state
 
 
-def transfer(graph: ProgramGraph, node: GraphNode, state: TaintState) -> TaintState:
+def transfer(
+    graph: ProgramGraph, node: GraphNode, state: TaintState,
+    call_values: Mapping[int, AbstractValue] | None = None,
+) -> TaintState:
     """Allocate lists, rebind variables, or mutate shared list memory."""
     if node.kind == "OPERATOR" and node.value == "listLiteral":
         for child in graph.ast_children(node.id):
-            state = _prepare_lists(graph, child, state)
-        return _allocate_list(graph, node, state)
+            state = _prepare_lists(graph, child, state, call_values=call_values)
+        return _allocate_list(graph, node, state, call_values=call_values)
     if node.kind != "OPERATOR":
         return state
     if node.value not in ASSIGNMENT_OPERATORS:
@@ -197,15 +223,17 @@ def transfer(graph: ProgramGraph, node: GraphNode, state: TaintState) -> TaintSt
         # A nested definition is a local CFG event. Callable bindings and the
         # nested body belong to Part 2 and are deliberately not modelled here.
         return state
-    state = _prepare_lists(graph, expression, state, refresh_unsequenced=True)
-    value = evaluate_expression(graph, expression, state)
+    state = _prepare_lists(graph, expression, state, refresh_unsequenced=True, call_values=call_values)
+    value = evaluate_expression(graph, expression, state, call_values=call_values)
     if node.value in AUGMENTED_ASSIGNMENTS:
-        value = _scalar_operator_value([evaluate_expression(graph, target, state), value])
+        value = _scalar_operator_value([
+            evaluate_expression(graph, target, state, call_values=call_values), value
+        ])
     if target.kind == "IDENTIFIER":
         return state.bind(target.value, value)
     if target.kind == "OPERATOR" and target.value == "indexAccess":
-        state = _prepare_lists(graph, target, state, refresh_unsequenced=True)
-        return _write_list(graph, target, value, state)
+        state = _prepare_lists(graph, target, state, refresh_unsequenced=True, call_values=call_values)
+        return _write_list(graph, target, value, state, call_values=call_values)
     raise NotImplementedError("Only IDENTIFIER and indexAccess assignment targets are supported")
 
 
@@ -291,11 +319,21 @@ def analyse_intraprocedural(graph: ProgramGraph, metadata: TestMetadata) -> bool
 
     if sink_point.id not in in_states:
         return False
-    sink_state = in_states[sink_point.id]
-    if sink_point == sink and sink.kind == "OPERATOR" and sink.value == "listLiteral":
-        sink_state = out_states[sink_point.id]
-    if sink_point.kind == "OPERATOR" and sink_point.value in ASSIGNMENT_OPERATORS:
-        # A target denotes the assigned value, whereas the RHS uses IN facts.
-        if graph.ast_children(sink_point.id)[0] == sink:
-            sink_state = out_states[sink_point.id]
+    sink_state = sink_state_at(
+        graph, sink, sink_point, in_states[sink_point.id], out_states[sink_point.id]
+    )
     return evaluate_scalar_expression(graph, sink, sink_state)
+
+
+def sink_state_at(
+    graph: ProgramGraph, sink: GraphNode, sink_point: GraphNode,
+    incoming: TaintState, outgoing: TaintState,
+) -> TaintState:
+    """Share sink timing between the intra- and interprocedural solvers."""
+    if sink_point == sink and sink.kind == "OPERATOR" and sink.value == "listLiteral":
+        return outgoing
+    if sink_point.kind == "OPERATOR" and sink_point.value in ASSIGNMENT_OPERATORS:
+        # Assignment targets observe the write; other expressions observe IN.
+        if graph.ast_children(sink_point.id)[0] == sink:
+            return outgoing
+    return incoming
