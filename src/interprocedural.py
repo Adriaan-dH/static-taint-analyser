@@ -1,4 +1,4 @@
-"""Direct top-level call analysis with invocation-local bindings and shared lists."""
+"""Top-level direct and single-target indirect calls with shared list memory."""
 
 from collections import deque
 from dataclasses import dataclass, replace
@@ -34,7 +34,7 @@ class InvocationResult:
     returns: bool
 
 
-class DirectCallAnalysis:
+class InterproceduralAnalysis:
     def __init__(self, graph: ProgramGraph, metadata: TestMetadata) -> None:
         self.graph = graph
         self.sink = graph.node(metadata.sink_node)
@@ -59,11 +59,25 @@ class DirectCallAnalysis:
                 if children and children[0].kind == "IDENTIFIER":
                     self.local_names[method.id].add(children[0].value)
 
-    def resolve(self, call: GraphNode, method: GraphNode) -> GraphNode | None:
+    def resolve(
+        self, call: GraphNode, method: GraphNode, state: TaintState,
+    ) -> GraphNode | None:
         if call.value in self.local_names[method.id]:
-            raise NotImplementedError(
-                f"Indirect or nested call {call.value!r} is not supported"
-            )
+            value = state.value(call.value)
+            if len(value.function_methods) > 1:
+                raise NotImplementedError("Multi-target indirect calls are not supported yet")
+            if (
+                len(value.function_methods) != 1 or value.may_be_scalar
+                or value.scalar_tainted or value.list_objects
+            ):
+                raise NotImplementedError(
+                    f"Local call {call.value!r} requires one definite function target; "
+                    "non-function values and nested definitions are not supported"
+                )
+            target = self.graph.node(next(iter(value.function_methods)))
+            if target.kind != "METHOD" or self.graph.ast_parent(target.id) is not None:
+                raise NotImplementedError("Nested function targets are not supported")
+            return target
         targets = self.top_level.get(call.value, [])
         if len(targets) == 1:
             return targets[0]
@@ -85,7 +99,14 @@ class DirectCallAnalysis:
             raise ValueError(
                 f"Call to {method.value!r}: expected {len(parameters)} arguments, got {len(actuals)}"
             )
+        # The exporter omits module definition events. Make visible module
+        # functions available as values without importing any caller locals.
         entry_state = TaintState(lists=caller.lists)
+        for name, targets in self.top_level.items():
+            if name not in self.local_names[method.id]:
+                entry_state = entry_state.bind(
+                    name, AbstractValue(function_methods=frozenset(m.id for m in targets))
+                )
         for parameter, value in zip(parameters, actuals):
             entry_state = entry_state.bind(parameter.value, value)
         entry = self.graph.method_entry(method.id)
@@ -182,7 +203,7 @@ class DirectCallAnalysis:
         values = dict(incoming.call_values)
         state = incoming.state
         if node.kind == "CALL":
-            target = self.resolve(node, method)
+            target = self.resolve(node, method, state)
             if target is None:
                 return incoming, False
             arguments = self.graph.ast_children(node.id)
@@ -207,7 +228,7 @@ class DirectCallAnalysis:
 
 
 def analyse_interprocedural(graph: ProgramGraph, metadata: TestMetadata) -> bool:
-    """Analyse direct calls from the designated source parameter's method."""
+    """Analyse top-level direct and definite single-target function calls."""
     source = graph.node(metadata.source_node)
     sink = graph.node(metadata.sink_node)
     method = graph.containing_method(source.id)
@@ -221,4 +242,4 @@ def analyse_interprocedural(graph: ProgramGraph, metadata: TestMetadata) -> bool
     ):
         raise NotImplementedError(f"Unsupported sink: {sink.kind} {sink.value!r}")
     actuals = tuple(TAINTED_SCALAR if p == source else CLEAN_SCALAR for p in parameters)
-    return DirectCallAnalysis(graph, metadata).invoke(method, actuals, TaintState(), ()).sink_tainted
+    return InterproceduralAnalysis(graph, metadata).invoke(method, actuals, TaintState(), ()).sink_tainted

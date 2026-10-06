@@ -5,17 +5,19 @@ from dataclasses import dataclass, replace
 
 @dataclass(frozen=True)
 class AbstractValue:
-    """Scalar possibilities and references can coexist after a path join."""
+    """Scalar, list, and METHOD-reference possibilities coexist after joins."""
 
     scalar_tainted: bool = False
     list_objects: frozenset[int] = frozenset()
     may_be_scalar: bool = False
+    function_methods: frozenset[int] = frozenset()
 
     def join(self, other: "AbstractValue") -> "AbstractValue":
         return AbstractValue(
             self.scalar_tainted or other.scalar_tainted,
             self.list_objects | other.list_objects,
             self.may_be_scalar or other.may_be_scalar,
+            self.function_methods | other.function_methods,
         )
 
 

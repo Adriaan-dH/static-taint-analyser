@@ -140,6 +140,8 @@ def evaluate_expression(
 
 
 def _scalar_operator_value(values: list[AbstractValue]) -> AbstractValue:
+    if any(value.function_methods for value in values):
+        raise NotImplementedError("Function arithmetic is not supported")
     if any(value.list_objects for value in values):
         raise NotImplementedError("List arithmetic is not supported")
     return AbstractValue(
@@ -192,7 +194,9 @@ def _write_list(
     targets = _list_targets(graph, target, state, call_values=call_values)
     _, index_node = _index_operands(graph, target)
     index = abstract_index(graph, index_node)
-    definite_object = len(targets.list_objects) == 1 and not targets.may_be_scalar
+    definite_object = (
+        len(targets.list_objects) == 1 and not targets.may_be_scalar and not targets.function_methods
+    )
     for object_id in targets.list_objects:
         memory = state.list_memory(object_id)
         strong = definite_object and index is not None and not memory.multiple_allocations

@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 
 from src.graph import GraphEdge, GraphNode, ProgramGraph, TestMetadata, load_test_case
-from src.interprocedural import analyse_interprocedural
+from src.interprocedural import FlowFacts, InterproceduralAnalysis, analyse_interprocedural
+from src.state import AbstractValue, CLEAN_SCALAR, TAINTED_SCALAR, TaintState
 
 
 CASES = Path(__file__).resolve().parents[1] / "testcases"
@@ -50,10 +51,17 @@ class FixtureTests(unittest.TestCase):
     def test_returned_list_reference(self) -> None:
         self.check_case("custom_p2_13_return_list_alias_true", True)
 
+    def test_supplied_indirect_alias_call(self) -> None:
+        self.check_case("test_inter5", True)
+
+    def test_simple_indirect_return(self) -> None:
+        self.check_case("custom_p2_08_indirect_simple_true", True)
+
+    def test_flow_sensitive_function_reassignment(self) -> None:
+        self.check_case("custom_p2_09_indirect_reassignment_false", False)
+
     def test_deferred_cases_raise(self) -> None:
-        names = ["test_inter5", "custom_p2_08_indirect_simple_true",
-                 "custom_p2_09_indirect_reassignment_false",
-                 "custom_p2_10_indirect_branch_true",
+        names = ["custom_p2_10_indirect_branch_true",
                  "custom_p2_14_nested_function_direct_true",
                  "custom_p2_15_shadowed_function_target"]
         for name in names:
@@ -292,7 +300,7 @@ class DirectCallTests(unittest.TestCase):
         self.g.ast(self.block, call)
         sink, value = self.g.sink(self.block, "x")
         self.g.cfg(self.main, assignment, call, sink, self.exit)
-        with self.assertRaisesRegex(NotImplementedError, "Indirect or nested"):
+        with self.assertRaisesRegex(NotImplementedError, "one definite function target"):
             self.g.analyse(self.source, value)
 
     def test_duplicate_top_level_targets_rejected(self) -> None:
@@ -422,6 +430,260 @@ class DirectCallTests(unittest.TestCase):
         self.g.cfg(self.main, assignment, sink, self.exit)
         with self.assertRaisesRegex(NotImplementedError, "Unsupported expression: CALL"):
             self.g.analyse(self.source, value)
+
+
+class FunctionValueTests(unittest.TestCase):
+    def test_function_reference_join_unions_method_ids(self) -> None:
+        foo = AbstractValue(function_methods=frozenset({10}))
+        bar = AbstractValue(function_methods=frozenset({20}))
+        self.assertEqual(foo.join(bar).function_methods, frozenset({10, 20}))
+        self.assertEqual(foo.join(foo), foo)
+        self.assertEqual(foo.join(bar), bar.join(foo))
+        self.assertEqual(foo.function_methods, frozenset({10}))
+
+    def test_mixed_join_preserves_existing_scalar_and_list_fields(self) -> None:
+        function = AbstractValue(function_methods=frozenset({10}))
+        data = AbstractValue(scalar_tainted=True, list_objects=frozenset({20}), may_be_scalar=True)
+        joined = function.join(data)
+        self.assertEqual(joined.function_methods, frozenset({10}))
+        self.assertEqual(joined.list_objects, data.list_objects)
+        self.assertTrue(joined.scalar_tainted)
+        self.assertTrue(joined.may_be_scalar)
+
+    def test_bind_replaces_function_reference(self) -> None:
+        foo = AbstractValue(function_methods=frozenset({10}))
+        bar = AbstractValue(function_methods=frozenset({20}))
+        initial = TaintState().bind("f", foo)
+        overwritten = initial.bind("f", bar)
+        self.assertEqual(overwritten.value("f"), bar)
+        self.assertEqual(initial.value("f"), foo)
+        self.assertEqual(overwritten.bind("f", CLEAN_SCALAR).value("f"), CLEAN_SCALAR)
+
+    def test_state_and_flow_joins_union_function_references(self) -> None:
+        left = TaintState().bind("f", AbstractValue(function_methods=frozenset({10})))
+        right = TaintState().bind("f", AbstractValue(function_methods=frozenset({20})))
+        self.assertEqual(left.join(right).value("f").function_methods, frozenset({10, 20}))
+        self.assertEqual(FlowFacts(left).join(FlowFacts(right)).state, left.join(right))
+
+    def test_function_reference_is_clean_even_inside_list(self) -> None:
+        function = AbstractValue(function_methods=frozenset({10}))
+        state = TaintState().allocate(20, (function,))
+        self.assertFalse(state.value_is_tainted(function))
+        self.assertFalse(state.value_is_tainted(AbstractValue(list_objects=frozenset({20}))))
+        self.assertTrue(state.value_is_tainted(function.join(TAINTED_SCALAR)))
+
+    def test_function_scalar_and_list_rebindings_are_independent(self) -> None:
+        function = AbstractValue(function_methods=frozenset({10}))
+        state = TaintState().taint("x").allocate(20, (CLEAN_SCALAR,)).bind("f", function)
+        state = state.bind("a", AbstractValue(list_objects=frozenset({20})))
+        self.assertTrue(state.is_tainted("x"))
+        self.assertFalse(state.is_tainted("f"))
+        self.assertFalse(state.is_tainted("a"))
+        self.assertEqual(state.value("a").function_methods, frozenset())
+        self.assertEqual(state.value("f").list_objects, frozenset())
+
+
+class FunctionReferenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.g = TestGraph()
+        self.main, self.block, self.exit, (self.source,) = self.g.method("main", "x")
+        self.foo = self.make_function("foo", "IDENTIFIER", "v")
+        self.bar = self.make_function("bar", "LITERAL", "0")
+
+    def make_function(self, name: str, kind: str, value: str) -> int:
+        method, block, exit_node, _ = self.g.method(name, "v")
+        returned = self.g.expression("RETURN", "RETURN", self.g.node(kind, value))
+        self.g.ast(block, returned)
+        self.g.cfg(method, returned, exit_node)
+        return method
+
+    def alias(self, target: str, value: str) -> int:
+        return self.g.assign(self.block, target, self.g.node("IDENTIFIER", value, 2))
+
+    def call_and_sink(self, name: str, *preceding: int) -> bool:
+        call = self.g.expression("CALL", name, self.g.node("IDENTIFIER", "x"), order=2)
+        assignment = self.g.assign(self.block, "y", call)
+        sink, value = self.g.sink(self.block, "y")
+        self.g.cfg(self.main, *preceding, call, assignment, sink, self.exit)
+        return self.g.analyse(self.source, value)
+
+    def resolver(self) -> tuple[InterproceduralAnalysis, ProgramGraph, int]:
+        self.alias("f", "foo")
+        call = self.g.expression("CALL", "f", self.g.node("IDENTIFIER", "x"))
+        self.g.ast(self.block, call)
+        graph = ProgramGraph(self.g.nodes, self.g.edges)
+        return InterproceduralAnalysis(graph, TestMetadata(self.source, self.source)), graph, call
+
+    def test_top_level_reference_assignment_then_indirect_return(self) -> None:
+        assignment = self.alias("f", "foo")
+        self.assertTrue(self.call_and_sink("f", assignment))
+
+    def test_function_reference_copy(self) -> None:
+        first = self.alias("f", "foo")
+        second = self.alias("g", "f")
+        self.assertTrue(self.call_and_sink("g", first, second))
+
+    def test_multiple_function_reference_copies(self) -> None:
+        points = [self.alias("f", "foo"), self.alias("g", "f"), self.alias("h", "g")]
+        self.assertTrue(self.call_and_sink("h", *points))
+
+    def test_function_reassignment_changes_target(self) -> None:
+        first = self.alias("f", "foo")
+        second = self.alias("f", "bar")
+        self.assertFalse(self.call_and_sink("f", first, second))
+
+    def test_function_to_scalar_reassignment_prevents_call(self) -> None:
+        first = self.alias("f", "foo")
+        second = self.g.assign(self.block, "f", self.g.node("LITERAL", "0", 2))
+        with self.assertRaisesRegex(NotImplementedError, "one definite function target"):
+            self.call_and_sink("f", first, second)
+
+    def test_function_to_list_reassignment_prevents_call(self) -> None:
+        first = self.alias("f", "foo")
+        literal = self.g.expression("OPERATOR", "listLiteral", self.g.node("LITERAL", "0"), order=2)
+        second = self.g.assign(self.block, "f", literal)
+        with self.assertRaisesRegex(NotImplementedError, "one definite function target"):
+            self.call_and_sink("f", first, literal, second)
+
+    def test_function_variable_can_shadow_top_level_name(self) -> None:
+        assignment = self.alias("foo", "bar")
+        self.assertFalse(self.call_and_sink("foo", assignment))
+
+    def test_empty_or_mixed_local_target_is_rejected(self) -> None:
+        analysis, graph, call = self.resolver()
+        function = AbstractValue(function_methods=frozenset({self.foo}))
+        for value in [AbstractValue(), CLEAN_SCALAR, function.join(CLEAN_SCALAR),
+                      function.join(AbstractValue(list_objects=frozenset({100})))]:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(NotImplementedError, "one definite function target"):
+                    analysis.resolve(graph.node(call), graph.node(self.main), TaintState().bind("f", value))
+
+    def test_single_target_resolution_uses_method_id(self) -> None:
+        analysis, graph, call = self.resolver()
+        value = AbstractValue(function_methods=frozenset({self.bar}))
+        target = analysis.resolve(graph.node(call), graph.node(self.main), TaintState().bind("f", value))
+        self.assertEqual(target, graph.node(self.bar))
+
+    def test_multi_target_resolution_is_explicitly_deferred(self) -> None:
+        analysis, graph, call = self.resolver()
+        value = AbstractValue(function_methods=frozenset({self.foo, self.bar}))
+        with self.assertRaisesRegex(NotImplementedError, "Multi-target"):
+            analysis.resolve(graph.node(call), graph.node(self.main), TaintState().bind("f", value))
+
+    def test_branch_fixture_has_both_targets_at_deferred_call(self) -> None:
+        from unittest.mock import patch
+
+        graph, metadata = load_test_case(CASES / "custom_p2_10_indirect_branch_true")
+        analysis = InterproceduralAnalysis(graph, metadata)
+        method = graph.containing_method(metadata.source_node)
+        actuals = tuple(
+            TAINTED_SCALAR if p.id == metadata.source_node else CLEAN_SCALAR
+            for p in graph.method_parameters(method.id)
+        )
+        recorded: list[AbstractValue] = []
+        resolve = analysis.resolve
+
+        def record(call: GraphNode, owner: GraphNode, state: TaintState) -> GraphNode | None:
+            if call.value == "f":
+                recorded.append(state.value("f"))
+            return resolve(call, owner, state)
+
+        with patch.object(analysis, "resolve", side_effect=record):
+            with self.assertRaisesRegex(NotImplementedError, "Multi-target"):
+                analysis.invoke(method, actuals, TaintState(), ())
+        expected_ids = frozenset(m.id for m in graph.methods if m.value in {"identity", "clean"})
+        self.assertEqual(recorded[-1].function_methods, expected_ids)
+        self.assertFalse(recorded[-1].may_be_scalar)
+
+    def test_function_reference_sink_is_clean(self) -> None:
+        assignment = self.alias("f", "foo")
+        sink, value = self.g.sink(self.block, "f")
+        self.g.cfg(self.main, assignment, sink, self.exit)
+        self.assertFalse(self.g.analyse(self.source, value))
+
+    def test_unassigned_local_name_does_not_fall_back_to_top_level(self) -> None:
+        # The disconnected assignment still declares a local name.
+        self.g.assign(self.block, "foo", self.g.node("LITERAL", "0", 2))
+        with self.assertRaisesRegex(NotImplementedError, "one definite function target"):
+            self.call_and_sink("foo")
+
+    def test_indirect_list_mutation_uses_shared_heap(self) -> None:
+        method, block, exit_node, _ = self.g.method("mutate", "a", "v")
+        access = self.g.expression("OPERATOR", "indexAccess", self.g.node("IDENTIFIER", "a"),
+                                   self.g.node("LITERAL", "0", 2))
+        write = self.g.expression("OPERATOR", "assignment", access,
+                                  self.g.node("IDENTIFIER", "v", 2))
+        self.g.ast(block, write)
+        self.g.cfg(method, access, write, exit_node)
+        alias = self.alias("f", "mutate")
+        literal = self.g.expression("OPERATOR", "listLiteral", self.g.node("LITERAL", "0"), order=2)
+        allocate = self.g.assign(self.block, "a", literal)
+        call = self.g.expression("CALL", "f", self.g.node("IDENTIFIER", "a", 1),
+                                 self.g.node("IDENTIFIER", "x", 2))
+        self.g.ast(self.block, call)
+        sink, value = self.g.sink(self.block, "a")
+        self.g.cfg(self.main, alias, literal, allocate, call, sink, self.exit)
+        self.assertTrue(self.g.analyse(self.source, value))
+
+    def test_function_parameter_can_be_called(self) -> None:
+        method, block, exit_node, _ = self.g.method("apply", "f", "v")
+        call = self.g.expression("CALL", "f", self.g.node("IDENTIFIER", "v"))
+        returned = self.g.expression("RETURN", "RETURN", call)
+        self.g.ast(block, returned)
+        self.g.cfg(method, call, returned, exit_node)
+        outer = self.g.expression("CALL", "apply", self.g.node("IDENTIFIER", "foo", 1),
+                                  self.g.node("IDENTIFIER", "x", 2), order=2)
+        assignment = self.g.assign(self.block, "y", outer)
+        sink, value = self.g.sink(self.block, "y")
+        self.g.cfg(self.main, outer, assignment, sink, self.exit)
+        self.assertTrue(self.g.analyse(self.source, value))
+
+    def test_function_return_can_be_called(self) -> None:
+        self.make_function("choose", "IDENTIFIER", "foo")
+        choose = self.g.expression("CALL", "choose", self.g.node("LITERAL", "0"), order=2)
+        bind = self.g.assign(self.block, "f", choose)
+        self.assertTrue(self.call_and_sink("f", choose, bind))
+
+    def test_indirect_recursion_remains_rejected(self) -> None:
+        assignment = self.alias("f", "main")
+        with self.assertRaisesRegex(NotImplementedError, "Recursive/cyclic"):
+            self.call_and_sink("f", assignment)
+
+    def test_function_arithmetic_is_not_silently_scalarised(self) -> None:
+        addition = self.g.expression("OPERATOR", "addition", self.g.node("IDENTIFIER", "foo"),
+                                     self.g.node("LITERAL", "1", 2), order=2)
+        assignment = self.g.assign(self.block, "f", addition)
+        sink, value = self.g.sink(self.block, "f")
+        self.g.cfg(self.main, addition, assignment, sink, self.exit)
+        with self.assertRaisesRegex(NotImplementedError, "Function arithmetic"):
+            self.g.analyse(self.source, value)
+
+    def test_part_one_identifier_semantics_remain_local(self) -> None:
+        from src.intraprocedural import analyse_intraprocedural
+
+        assignment = self.alias("f", "foo")
+        sink, value = self.g.sink(self.block, "f")
+        self.g.cfg(self.main, assignment, sink, self.exit)
+        graph = ProgramGraph(self.g.nodes, self.g.edges)
+        self.assertFalse(analyse_intraprocedural(graph, TestMetadata(self.source, value)))
+
+    def test_function_copy_keeps_value_after_original_is_rebound(self) -> None:
+        first = self.alias("f", "foo")
+        copy = self.alias("g", "f")
+        rebind = self.alias("f", "bar")
+        self.assertTrue(self.call_and_sink("g", first, copy, rebind))
+
+    def test_branch_join_with_same_target_remains_definite(self) -> None:
+        condition = self.g.node("IDENTIFIER", "c")
+        self.g.ast(self.block, condition)
+        left = self.alias("f", "foo")
+        right = self.alias("f", "foo")
+        call = self.g.expression("CALL", "f", self.g.node("IDENTIFIER", "x"), order=2)
+        assignment = self.g.assign(self.block, "y", call)
+        sink, value = self.g.sink(self.block, "y")
+        self.g.cfg(self.main, condition, left, call, assignment, sink, self.exit)
+        self.g.cfg(condition, right, call)
+        self.assertTrue(self.g.analyse(self.source, value))
 
 
 if __name__ == "__main__":
