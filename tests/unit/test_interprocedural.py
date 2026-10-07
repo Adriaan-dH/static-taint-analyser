@@ -4,7 +4,9 @@ import unittest
 from pathlib import Path
 
 from src.graph import GraphEdge, GraphNode, ProgramGraph, TestMetadata, load_test_case
-from src.interprocedural import FlowFacts, InterproceduralAnalysis, analyse_interprocedural
+from src.interprocedural import (
+    FlowFacts, InterproceduralAnalysis, InvocationResult, analyse_interprocedural,
+)
 from src.state import AbstractValue, CLEAN_SCALAR, TAINTED_SCALAR, TaintState
 
 
@@ -60,14 +62,14 @@ class FixtureTests(unittest.TestCase):
     def test_flow_sensitive_function_reassignment(self) -> None:
         self.check_case("custom_p2_09_indirect_reassignment_false", False)
 
-    def test_deferred_cases_raise(self) -> None:
-        names = ["custom_p2_10_indirect_branch_true",
-                 "custom_p2_14_nested_function_direct_true",
-                 "custom_p2_15_shadowed_function_target"]
-        for name in names:
-            with self.subTest(case=name):
-                with self.assertRaises(NotImplementedError):
-                    analyse_interprocedural(*load_test_case(CASES / name))
+    def test_multi_target_branch_call(self) -> None:
+        self.check_case("custom_p2_10_indirect_branch_true", True)
+
+    def test_nested_function_call(self) -> None:
+        self.check_case("custom_p2_14_nested_function_direct_true", True)
+
+    def test_nested_function_shadows_top_level(self) -> None:
+        self.check_case("custom_p2_15_shadowed_function_target", False)
 
     def test_part_one_fixtures_through_interprocedural_entry(self) -> None:
         expected = [True, False, True, False, True, False, True, False,
@@ -300,7 +302,7 @@ class DirectCallTests(unittest.TestCase):
         self.g.ast(self.block, call)
         sink, value = self.g.sink(self.block, "x")
         self.g.cfg(self.main, assignment, call, sink, self.exit)
-        with self.assertRaisesRegex(NotImplementedError, "one definite function target"):
+        with self.assertRaisesRegex(NotImplementedError, "requires function targets"):
             self.g.analyse(self.source, value)
 
     def test_duplicate_top_level_targets_rejected(self) -> None:
@@ -535,14 +537,14 @@ class FunctionReferenceTests(unittest.TestCase):
     def test_function_to_scalar_reassignment_prevents_call(self) -> None:
         first = self.alias("f", "foo")
         second = self.g.assign(self.block, "f", self.g.node("LITERAL", "0", 2))
-        with self.assertRaisesRegex(NotImplementedError, "one definite function target"):
+        with self.assertRaisesRegex(NotImplementedError, "requires function targets"):
             self.call_and_sink("f", first, second)
 
     def test_function_to_list_reassignment_prevents_call(self) -> None:
         first = self.alias("f", "foo")
         literal = self.g.expression("OPERATOR", "listLiteral", self.g.node("LITERAL", "0"), order=2)
         second = self.g.assign(self.block, "f", literal)
-        with self.assertRaisesRegex(NotImplementedError, "one definite function target"):
+        with self.assertRaisesRegex(NotImplementedError, "requires function targets"):
             self.call_and_sink("f", first, literal, second)
 
     def test_function_variable_can_shadow_top_level_name(self) -> None:
@@ -555,22 +557,22 @@ class FunctionReferenceTests(unittest.TestCase):
         for value in [AbstractValue(), CLEAN_SCALAR, function.join(CLEAN_SCALAR),
                       function.join(AbstractValue(list_objects=frozenset({100})))]:
             with self.subTest(value=value):
-                with self.assertRaisesRegex(NotImplementedError, "one definite function target"):
+                with self.assertRaisesRegex(NotImplementedError, "requires function targets"):
                     analysis.resolve(graph.node(call), graph.node(self.main), TaintState().bind("f", value))
 
     def test_single_target_resolution_uses_method_id(self) -> None:
         analysis, graph, call = self.resolver()
         value = AbstractValue(function_methods=frozenset({self.bar}))
         target = analysis.resolve(graph.node(call), graph.node(self.main), TaintState().bind("f", value))
-        self.assertEqual(target, graph.node(self.bar))
+        self.assertEqual(target, (graph.node(self.bar),))
 
-    def test_multi_target_resolution_is_explicitly_deferred(self) -> None:
+    def test_multi_target_resolution_returns_all_method_ids(self) -> None:
         analysis, graph, call = self.resolver()
         value = AbstractValue(function_methods=frozenset({self.foo, self.bar}))
-        with self.assertRaisesRegex(NotImplementedError, "Multi-target"):
-            analysis.resolve(graph.node(call), graph.node(self.main), TaintState().bind("f", value))
+        targets = analysis.resolve(graph.node(call), graph.node(self.main), TaintState().bind("f", value))
+        self.assertEqual({target.id for target in targets}, {self.foo, self.bar})
 
-    def test_branch_fixture_has_both_targets_at_deferred_call(self) -> None:
+    def test_branch_fixture_has_both_targets_at_call(self) -> None:
         from unittest.mock import patch
 
         graph, metadata = load_test_case(CASES / "custom_p2_10_indirect_branch_true")
@@ -583,14 +585,13 @@ class FunctionReferenceTests(unittest.TestCase):
         recorded: list[AbstractValue] = []
         resolve = analysis.resolve
 
-        def record(call: GraphNode, owner: GraphNode, state: TaintState) -> GraphNode | None:
+        def record(call: GraphNode, owner: GraphNode, state: TaintState) -> tuple[GraphNode, ...]:
             if call.value == "f":
                 recorded.append(state.value("f"))
             return resolve(call, owner, state)
 
         with patch.object(analysis, "resolve", side_effect=record):
-            with self.assertRaisesRegex(NotImplementedError, "Multi-target"):
-                analysis.invoke(method, actuals, TaintState(), ())
+            self.assertTrue(analysis.invoke(method, actuals, TaintState(), ()).sink_tainted)
         expected_ids = frozenset(m.id for m in graph.methods if m.value in {"identity", "clean"})
         self.assertEqual(recorded[-1].function_methods, expected_ids)
         self.assertFalse(recorded[-1].may_be_scalar)
@@ -604,7 +605,7 @@ class FunctionReferenceTests(unittest.TestCase):
     def test_unassigned_local_name_does_not_fall_back_to_top_level(self) -> None:
         # The disconnected assignment still declares a local name.
         self.g.assign(self.block, "foo", self.g.node("LITERAL", "0", 2))
-        with self.assertRaisesRegex(NotImplementedError, "one definite function target"):
+        with self.assertRaisesRegex(NotImplementedError, "requires function targets"):
             self.call_and_sink("foo")
 
     def test_indirect_list_mutation_uses_shared_heap(self) -> None:
@@ -684,6 +685,260 @@ class FunctionReferenceTests(unittest.TestCase):
         self.g.cfg(self.main, condition, left, call, assignment, sink, self.exit)
         self.g.cfg(condition, right, call)
         self.assertTrue(self.g.analyse(self.source, value))
+
+
+class MultiTargetTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.g = TestGraph()
+        self.main, self.block, self.exit, (self.source,) = self.g.method("main", "x")
+
+    def returning(self, name: str, kind: str, value: str) -> int:
+        method, block, exit_node, _ = self.g.method(name, "v")
+        returned = self.g.expression("RETURN", "RETURN", self.g.node(kind, value))
+        self.g.ast(block, returned)
+        self.g.cfg(method, returned, exit_node)
+        return method
+
+    def mutator(self, name: str, kind: str, value: str, diverges: bool = False) -> int:
+        method, block, exit_node, _ = self.g.method(name, "a", "v")
+        access = self.g.expression("OPERATOR", "indexAccess", self.g.node("IDENTIFIER", "a"),
+                                   self.g.node("LITERAL", "0", 2))
+        write = self.g.expression("OPERATOR", "assignment", access, self.g.node(kind, value, 2))
+        self.g.ast(block, write)
+        if diverges:
+            loop = self.g.node("IDENTIFIER", "c")
+            self.g.ast(block, loop)
+            self.g.cfg(method, access, write, loop, loop)
+        else:
+            self.g.cfg(method, access, write, exit_node)
+        return method
+
+    def invoke(self, targets: tuple[int, ...], actuals: tuple[AbstractValue, ...],
+               caller: TaintState = TaintState(), sink: int | None = None) -> InvocationResult:
+        graph = ProgramGraph(self.g.nodes, self.g.edges)
+        analysis = InterproceduralAnalysis(
+            graph, TestMetadata(self.source, self.source if sink is None else sink)
+        )
+        return analysis.invoke_targets(tuple(graph.node(i) for i in targets), actuals, caller, ())
+
+    def test_tainted_and_clean_returns_join(self) -> None:
+        identity = self.returning("identity", "IDENTIFIER", "v")
+        clean = self.returning("clean", "LITERAL", "0")
+        result = self.invoke((identity, clean), (TAINTED_SCALAR,))
+        self.assertTrue(result.value.scalar_tainted)
+        self.assertTrue(result.returns)
+
+    def test_two_clean_returns_remain_clean(self) -> None:
+        first = self.returning("first", "LITERAL", "0")
+        second = self.returning("second", "LITERAL", "1")
+        result = self.invoke((first, second), (TAINTED_SCALAR,))
+        self.assertEqual(result.value, CLEAN_SCALAR)
+
+    def test_list_side_effects_join_without_local_leaks(self) -> None:
+        taint = self.mutator("taint", "IDENTIFIER", "v")
+        clean = self.mutator("clean", "LITERAL", "0")
+        caller = TaintState().allocate(1000, (CLEAN_SCALAR,)).taint("caller")
+        reference = AbstractValue(list_objects=frozenset({1000}))
+        result = self.invoke((taint, clean), (reference, TAINTED_SCALAR), caller)
+        self.assertTrue(result.state.list_memory(1000).read(0).scalar_tainted)
+        self.assertEqual(result.state.bindings, caller.bindings)
+        self.assertFalse(caller.list_memory(1000).read(0).scalar_tainted)
+
+    def test_alternatives_start_from_same_heap(self) -> None:
+        clean = self.mutator("clean", "LITERAL", "0")
+        passive, _, exit_node, _ = self.g.method("passive", "a", "v")
+        self.g.cfg(passive, exit_node)
+        caller = TaintState().allocate(1000, (TAINTED_SCALAR,))
+        actuals = (AbstractValue(list_objects=frozenset({1000})), CLEAN_SCALAR)
+        for targets in [(clean, passive), (passive, clean)]:
+            result = self.invoke(targets, actuals, caller)
+            self.assertTrue(result.state.list_memory(1000).read(0).scalar_tainted)
+
+    def test_nonreturning_alternative_does_not_contribute_heap(self) -> None:
+        diverging = self.mutator("diverging", "IDENTIFIER", "v", diverges=True)
+        clean = self.mutator("clean", "LITERAL", "0")
+        caller = TaintState().allocate(1000, (CLEAN_SCALAR,))
+        actuals = (AbstractValue(list_objects=frozenset({1000})), TAINTED_SCALAR)
+        result = self.invoke((diverging, clean), actuals, caller)
+        self.assertTrue(result.returns)
+        self.assertFalse(result.state.list_memory(1000).read(0).scalar_tainted)
+
+    def test_all_nonreturning_targets_prune_continuation(self) -> None:
+        first = self.mutator("first", "IDENTIFIER", "v", diverges=True)
+        second = self.mutator("second", "LITERAL", "0", diverges=True)
+        caller = TaintState().allocate(1000, (CLEAN_SCALAR,))
+        actuals = (AbstractValue(list_objects=frozenset({1000})), TAINTED_SCALAR)
+        self.assertFalse(self.invoke((first, second), actuals, caller).returns)
+
+    def test_sink_in_only_one_nonreturning_alternative_is_observed(self) -> None:
+        diverging, block, _, _ = self.g.method("diverging", "v")
+        sink, value = self.g.sink(block, "v")
+        self.g.cfg(diverging, sink, sink)
+        returning = self.returning("returning", "LITERAL", "0")
+        result = self.invoke((returning, diverging), (TAINTED_SCALAR,), sink=value)
+        self.assertTrue(result.sink_tainted)
+        self.assertTrue(result.returns)
+        self.assertEqual(result.value, CLEAN_SCALAR)
+
+    def test_any_target_arity_mismatch_is_explicit(self) -> None:
+        first = self.returning("first", "IDENTIFIER", "v")
+        other, _, exit_node, _ = self.g.method("other", "a", "b")
+        self.g.cfg(other, exit_node)
+        with self.assertRaisesRegex(ValueError, "expected 2 arguments, got 1"):
+            self.invoke((first, other), (TAINTED_SCALAR,))
+        with self.assertRaisesRegex(ValueError, "got 0"):
+            self.invoke((first, other), ())
+
+    def test_multi_target_cycle_remains_explicit(self) -> None:
+        other = self.returning("other", "IDENTIFIER", "v")
+        graph = ProgramGraph(self.g.nodes, self.g.edges)
+        analysis = InterproceduralAnalysis(graph, TestMetadata(self.source, self.source))
+        with self.assertRaisesRegex(NotImplementedError, "Recursive/cyclic"):
+            analysis.invoke_targets((graph.node(other), graph.node(self.main)),
+                                    (TAINTED_SCALAR,), TaintState(), (self.main,))
+
+    def test_multi_target_call_in_loop_revisits_result(self) -> None:
+        identity = self.returning("identity", "IDENTIFIER", "v")
+        clean = self.returning("clean", "LITERAL", "0")
+        f = self.g.node("PARAMETER", "f", 2)
+        self.g.ast(self.main, f)
+        initial = self.g.assign(self.block, "y", self.g.node("LITERAL", "0", 2))
+        call = self.g.expression("CALL", "f", self.g.node("IDENTIFIER", "y"), order=2)
+        bind = self.g.assign(self.block, "z", call)
+        taint = self.g.assign(self.block, "y", self.g.node("IDENTIFIER", "x", 2))
+        condition = self.g.node("IDENTIFIER", "c")
+        self.g.ast(self.block, condition)
+        sink, value = self.g.sink(self.block, "z")
+        self.g.cfg(self.main, initial, call, bind, taint, condition, call)
+        self.g.cfg(condition, sink, self.exit)
+        graph = ProgramGraph(self.g.nodes, self.g.edges)
+        analysis = InterproceduralAnalysis(graph, TestMetadata(self.source, value))
+        functions = AbstractValue(function_methods=frozenset({identity, clean}))
+        self.assertTrue(analysis.invoke(graph.node(self.main), (TAINTED_SCALAR, functions),
+                                        TaintState(), ()).sink_tainted)
+
+
+class NestedFunctionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.g = TestGraph()
+        self.main, self.block, self.exit, (self.source,) = self.g.method("main", "x")
+
+    def nested(self, owner: int, block: int, name: str, kind: str = "IDENTIFIER",
+               value: str = "v") -> tuple[int, int]:
+        method, body, exit_node, _ = self.g.method(name, "v")
+        self.g.ast(owner, method)
+        returned = self.g.expression("RETURN", "RETURN", self.g.node(kind, value))
+        self.g.ast(body, returned)
+        self.g.cfg(method, returned, exit_node)
+        definition = self.g.assign(block, name, self.g.node("METHOD_REF", name, 2))
+        return method, definition
+
+    def call_and_sink(self, name: str, *preceding: int) -> bool:
+        call = self.g.expression("CALL", name, self.g.node("IDENTIFIER", "x"), order=2)
+        bind = self.g.assign(self.block, "y", call)
+        sink, value = self.g.sink(self.block, "y")
+        self.g.cfg(self.main, *preceding, call, bind, sink, self.exit)
+        return self.g.analyse(self.source, value)
+
+    def test_nested_definition_binds_lexical_method_id(self) -> None:
+        nested, definition = self.nested(self.main, self.block, "inner")
+        graph = ProgramGraph(self.g.nodes, self.g.edges)
+        analysis = InterproceduralAnalysis(graph, TestMetadata(self.source, self.source))
+        facts, _ = analysis.step(graph.node(definition), graph.node(self.main),
+                                 FlowFacts(TaintState()), (self.main,))
+        self.assertEqual(facts.state.value("inner").function_methods, frozenset({nested}))
+
+    def test_nested_reference_can_be_copied(self) -> None:
+        _, definition = self.nested(self.main, self.block, "inner")
+        first = self.g.assign(self.block, "f", self.g.node("IDENTIFIER", "inner", 2))
+        second = self.g.assign(self.block, "g", self.g.node("IDENTIFIER", "f", 2))
+        self.assertTrue(self.call_and_sink("g", definition, first, second))
+
+    def test_call_before_definition_cannot_fall_back_to_module_function(self) -> None:
+        root, body, exit_node, _ = self.g.method("inner", "v")
+        returned = self.g.expression("RETURN", "RETURN", self.g.node("IDENTIFIER", "v"))
+        self.g.ast(body, returned)
+        self.g.cfg(root, returned, exit_node)
+        self.nested(self.main, self.block, "inner", "LITERAL", "0")
+        with self.assertRaisesRegex(NotImplementedError, "requires function targets"):
+            self.call_and_sink("inner")
+
+    def test_same_name_nested_and_module_methods_keep_distinct_ids(self) -> None:
+        root, _, root_exit, _ = self.g.method("f", "v")
+        self.g.cfg(root, root_exit)
+        nested, definition = self.nested(self.main, self.block, "f", "LITERAL", "0")
+        self.assertNotEqual(root, nested)
+        graph = ProgramGraph(self.g.nodes, self.g.edges)
+        analysis = InterproceduralAnalysis(graph, TestMetadata(self.source, self.source))
+        reference = next(n for n in graph.ast_children(definition) if n.kind == "METHOD_REF")
+        self.assertEqual(analysis.nested_reference(reference, graph.node(self.main)).function_methods,
+                         frozenset({nested}))
+
+    def test_duplicate_nested_names_are_explicitly_ambiguous(self) -> None:
+        self.nested(self.main, self.block, "inner")
+        _, definition = self.nested(self.main, self.block, "inner", "LITERAL", "0")
+        with self.assertRaisesRegex(NotImplementedError, "found 2"):
+            self.call_and_sink("inner", definition)
+
+    def test_reference_does_not_resolve_nested_method_in_another_scope(self) -> None:
+        outer, body, _, _ = self.g.method("other", "v")
+        self.nested(outer, body, "inner")
+        definition = self.g.assign(self.block, "inner", self.g.node("METHOD_REF", "inner", 2))
+        with self.assertRaisesRegex(NotImplementedError, "found 0"):
+            self.call_and_sink("inner", definition)
+
+    def test_deeper_nesting_uses_same_definition_and_invocation_rules(self) -> None:
+        outer, body, exit_node, _ = self.g.method("outer", "v")
+        self.g.ast(self.main, outer)
+        _, definition = self.nested(outer, body, "inner")
+        call = self.g.expression("CALL", "inner", self.g.node("IDENTIFIER", "v"))
+        returned = self.g.expression("RETURN", "RETURN", call)
+        self.g.ast(body, returned)
+        self.g.cfg(outer, definition, call, returned, exit_node)
+        define_outer = self.g.assign(self.block, "outer", self.g.node("METHOD_REF", "outer", 2))
+        self.assertTrue(self.call_and_sink("outer", define_outer))
+
+    def test_top_level_and_nested_targets_join(self) -> None:
+        root, body, root_exit, _ = self.g.method("identity", "v")
+        returned = self.g.expression("RETURN", "RETURN", self.g.node("IDENTIFIER", "v"))
+        self.g.ast(body, returned)
+        self.g.cfg(root, returned, root_exit)
+        _, definition = self.nested(self.main, self.block, "inner", "LITERAL", "0")
+        condition = self.g.node("IDENTIFIER", "c")
+        self.g.ast(self.block, condition)
+        left = self.g.assign(self.block, "f", self.g.node("IDENTIFIER", "identity", 2))
+        right = self.g.assign(self.block, "f", self.g.node("IDENTIFIER", "inner", 2))
+        call = self.g.expression("CALL", "f", self.g.node("IDENTIFIER", "x"), order=2)
+        bind = self.g.assign(self.block, "y", call)
+        sink, value = self.g.sink(self.block, "y")
+        self.g.cfg(self.main, definition, condition, left, call, bind, sink, self.exit)
+        self.g.cfg(condition, right, call)
+        self.assertTrue(self.g.analyse(self.source, value))
+
+    def test_nested_direct_recursion_is_rejected(self) -> None:
+        inner, body, exit_node, _ = self.g.method("inner", "v")
+        self.g.ast(self.main, inner)
+        recursive = self.g.expression("CALL", "inner", self.g.node("IDENTIFIER", "v"))
+        self.g.ast(body, recursive)
+        self.g.cfg(inner, recursive, exit_node)
+        definition = self.g.assign(self.block, "inner", self.g.node("METHOD_REF", "inner", 2))
+        with self.assertRaisesRegex(NotImplementedError, "Recursive/cyclic"):
+            self.call_and_sink("inner", definition)
+
+    def test_nested_indirect_recursion_is_rejected(self) -> None:
+        inner, body, exit_node, _ = self.g.method("inner", "f", "v")
+        self.g.ast(self.main, inner)
+        recursive = self.g.expression("CALL", "f", self.g.node("IDENTIFIER", "f", 1),
+                                      self.g.node("IDENTIFIER", "v", 2))
+        self.g.ast(body, recursive)
+        self.g.cfg(inner, recursive, exit_node)
+        definition = self.g.assign(self.block, "inner", self.g.node("METHOD_REF", "inner", 2))
+        call = self.g.expression("CALL", "inner", self.g.node("IDENTIFIER", "inner", 1),
+                                 self.g.node("IDENTIFIER", "x", 2))
+        self.g.ast(self.block, call)
+        self.g.cfg(self.main, definition, call, self.exit)
+        with self.assertRaisesRegex(NotImplementedError, "Recursive/cyclic"):
+            self.g.analyse(self.source, self.source)
 
 
 if __name__ == "__main__":

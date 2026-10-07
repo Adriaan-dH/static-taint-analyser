@@ -1,4 +1,4 @@
-"""Top-level direct and single-target indirect calls with shared list memory."""
+"""Flow-sensitive direct, indirect, and nested calls with shared list memory."""
 
 from collections import deque
 from dataclasses import dataclass, replace
@@ -40,11 +40,16 @@ class InterproceduralAnalysis:
         self.sink = graph.node(metadata.sink_node)
         self.sink_method = graph.containing_method(self.sink.id)
         self.top_level: dict[str, list[GraphNode]] = {}
+        self.nested_methods: dict[tuple[int, str], list[GraphNode]] = {}
         self.local_names: dict[int, set[str]] = {}
         self.call_ids: dict[int, list[int]] = {}
         for method in graph.methods:
-            if graph.ast_parent(method.id) is None:
+            parent = graph.ast_parent(method.id)
+            owner = graph.containing_method(parent.id) if parent is not None else None
+            if owner is None:
                 self.top_level.setdefault(method.value, []).append(method)
+            else:
+                self.nested_methods.setdefault((owner.id, method.value), []).append(method)
             self.local_names[method.id] = {
                 parameter.value for parameter in graph.method_parameters(method.id)
             }
@@ -61,32 +66,68 @@ class InterproceduralAnalysis:
 
     def resolve(
         self, call: GraphNode, method: GraphNode, state: TaintState,
-    ) -> GraphNode | None:
+    ) -> tuple[GraphNode, ...]:
         if call.value in self.local_names[method.id]:
             value = state.value(call.value)
-            if len(value.function_methods) > 1:
-                raise NotImplementedError("Multi-target indirect calls are not supported yet")
             if (
-                len(value.function_methods) != 1 or value.may_be_scalar
+                not value.function_methods or value.may_be_scalar
                 or value.scalar_tainted or value.list_objects
             ):
                 raise NotImplementedError(
-                    f"Local call {call.value!r} requires one definite function target; "
-                    "non-function values and nested definitions are not supported"
+                    f"Local call {call.value!r} requires function targets without scalar/list values"
                 )
-            target = self.graph.node(next(iter(value.function_methods)))
-            if target.kind != "METHOD" or self.graph.ast_parent(target.id) is not None:
-                raise NotImplementedError("Nested function targets are not supported")
-            return target
+            targets = tuple(self.graph.node(node_id) for node_id in sorted(value.function_methods))
+            if any(target.kind != "METHOD" for target in targets):
+                raise ValueError("Function references must identify METHOD nodes")
+            return targets
+        # A nested self-call is recursive even though its enclosing binding
+        # is not captured into this invocation's local state.
+        if call.value == method.value and self.graph.ast_parent(method.id) is not None:
+            return (method,)
         targets = self.top_level.get(call.value, [])
         if len(targets) == 1:
-            return targets[0]
+            return (targets[0],)
         if targets:
             raise NotImplementedError(f"Ambiguous direct call target {call.value!r}")
         parent = self.graph.ast_parent(call.id)
         if call.value in {"sink", "print"} and parent is not None and parent.kind == "BLOCK":
-            return None
+            return ()
         raise NotImplementedError(f"Unresolved direct or indirect call {call.value!r}")
+
+    def nested_reference(self, reference: GraphNode, method: GraphNode) -> AbstractValue:
+        targets = self.nested_methods.get((method.id, reference.value), [])
+        if len(targets) != 1:
+            raise NotImplementedError(
+                f"METHOD_REF {reference.value!r} in {method.value!r}: "
+                f"expected one lexical nested METHOD, found {len(targets)}"
+            )
+        return AbstractValue(function_methods=frozenset({targets[0].id}))
+
+    def invoke_targets(
+        self, targets: tuple[GraphNode, ...], actuals: tuple[AbstractValue, ...],
+        caller: TaintState, stack: tuple[int, ...],
+    ) -> InvocationResult:
+        # Reject inconsistent arity before analysing any alternative; runtime
+        # argument-error paths are outside the supported abstraction.
+        for target in targets:
+            count = len(self.graph.method_parameters(target.id))
+            if count != len(actuals):
+                raise ValueError(
+                    f"Call to {target.value!r}: expected {count} arguments, got {len(actuals)}"
+                )
+        value = AbstractValue()
+        heap = TaintState()
+        sink_tainted = False
+        returns = False
+        for target in targets:
+            result = self.invoke(target, actuals, caller, stack)
+            sink_tainted |= result.sink_tainted
+            if result.returns:
+                returns = True
+                value = value.join(result.value)
+                heap = heap.join(TaintState(lists=result.state.lists))
+        state = replace(caller, lists=heap.lists) if returns else caller
+        return InvocationResult(value, state, sink_tainted, returns)
 
     def invoke(
         self, method: GraphNode, actuals: tuple[AbstractValue, ...],
@@ -203,8 +244,8 @@ class InterproceduralAnalysis:
         values = dict(incoming.call_values)
         state = incoming.state
         if node.kind == "CALL":
-            target = self.resolve(node, method, state)
-            if target is None:
+            targets = self.resolve(node, method, state)
+            if not targets:
                 return incoming, False
             arguments = self.graph.ast_children(node.id)
             for argument in arguments:
@@ -213,13 +254,21 @@ class InterproceduralAnalysis:
                 evaluate_expression(self.graph, argument, state, values)
                 for argument in arguments
             )
-            result = self.invoke(target, actuals, state, stack)
+            result = self.invoke_targets(targets, actuals, state, stack)
             if not result.returns:
                 return None, result.sink_tainted
             values[node.id] = result.value
             # Restore caller locals while retaining callee heap effects.
             state = replace(state, lists=result.state.lists)
             return FlowFacts(state, tuple(sorted(values.items()))), result.sink_tainted
+        if node.kind == "OPERATOR" and node.value == "assignment":
+            children = self.graph.ast_children(node.id)
+            if len(children) == 2 and children[1].kind == "METHOD_REF":
+                target, reference = children
+                if target.kind != "IDENTIFIER":
+                    raise NotImplementedError("Nested definitions require an IDENTIFIER target")
+                state = state.bind(target.value, self.nested_reference(reference, method))
+                return FlowFacts(state, incoming.call_values), False
         if node.kind == "RETURN":
             for expression in self.graph.ast_children(node.id):
                 state = _prepare_lists(self.graph, expression, state, call_values=values)
@@ -228,7 +277,7 @@ class InterproceduralAnalysis:
 
 
 def analyse_interprocedural(graph: ProgramGraph, metadata: TestMetadata) -> bool:
-    """Analyse top-level direct and definite single-target function calls."""
+    """Analyse direct and indirect calls, including lexical nested definitions."""
     source = graph.node(metadata.source_node)
     sink = graph.node(metadata.sink_node)
     method = graph.containing_method(source.id)
