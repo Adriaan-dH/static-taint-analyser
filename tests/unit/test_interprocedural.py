@@ -83,7 +83,7 @@ class FixtureTests(unittest.TestCase):
 
 
 class TestGraph:
-    """Small explicit AST/CFG builder; never parses or executes target code."""
+    """Small explicit AST/CFG builder that never parses or executes target code."""
 
     def __init__(self) -> None:
         self.nodes: list[GraphNode] = []

@@ -36,7 +36,7 @@ NO_EFFECT_OPERATORS = {"pass"}
 
 
 def abstract_index(graph: ProgramGraph, node: GraphNode) -> int | None:
-    """Recognise integer syntax only; all other expressions denote any index."""
+    """Recognise integer syntax only. All other expressions denote any index."""
     if node.kind == "LITERAL" and re.fullmatch(r"[0-9]+", node.value):
         return int(node.value)
     if node.kind == "OPERATOR" and node.value in SIGN_OPERATORS:
@@ -110,8 +110,8 @@ def evaluate_expression(
         if len(children) != 3:
             raise ValueError(f"Conditional {node.id}: expected condition and two alternatives")
         evaluate_expression(graph, children[0], state, call_values=call_values)
-        # Like an if/else assignment, both value alternatives are reachable;
-        # the predicate does not introduce implicit control-flow taint.
+        # Like an if/else assignment, both value alternatives are reachable.
+        # The predicate does not introduce implicit control-flow taint.
         return evaluate_expression(graph, children[1], state, call_values=call_values).join(
             evaluate_expression(graph, children[2], state, call_values=call_values)
         )
@@ -133,7 +133,7 @@ def evaluate_expression(
             for operand in operands
         ]
         if node.value in BOOLEAN_OPERATORS:
-            # Follow the assignment's Boolean abstraction, also for and/or.
+            # Boolean operators produce clean scalar values, including and/or.
             return CLEAN_SCALAR
         return _scalar_operator_value(values)
     raise NotImplementedError(f"Unsupported expression: {node.kind} {node.value!r}")
@@ -199,6 +199,8 @@ def _write_list(
     )
     for object_id in targets.list_objects:
         memory = state.list_memory(object_id)
+        # Replace a cell only when one object and one index are certain.
+        # Repeated allocations at the same node require a weak update.
         strong = definite_object and index is not None and not memory.multiple_allocations
         state = state.with_list(object_id, memory.write(index, value, strong))
     return state
@@ -225,7 +227,7 @@ def transfer(
     target, expression = children
     if expression.kind == "METHOD_REF" and node.value == "assignment":
         # A nested definition is a local CFG event. Callable bindings and the
-        # nested body belong to Part 2 and are deliberately not modelled here.
+        # nested body are handled by the interprocedural solver.
         return state
     state = _prepare_lists(graph, expression, state, refresh_unsequenced=True, call_values=call_values)
     value = evaluate_expression(graph, expression, state, call_values=call_values)
@@ -272,7 +274,7 @@ def analyse_intraprocedural(graph: ProgramGraph, metadata: TestMetadata) -> bool
     """Check a scalar or list sink in the source parameter's method.
 
     Only parameter sources are supported. Calls and control
-    predicates preserve state; their results do not change CFG reachability.
+    predicates preserve state. Their results do not change CFG reachability.
     """
     source = graph.node(metadata.source_node)
     sink = graph.node(metadata.sink_node)
@@ -337,7 +339,7 @@ def sink_state_at(
     if sink_point == sink and sink.kind == "OPERATOR" and sink.value == "listLiteral":
         return outgoing
     if sink_point.kind == "OPERATOR" and sink_point.value in ASSIGNMENT_OPERATORS:
-        # Assignment targets observe the write; other expressions observe IN.
+        # Assignment targets observe the write. Other expressions observe IN.
         if graph.ast_children(sink_point.id)[0] == sink:
             return outgoing
     return incoming

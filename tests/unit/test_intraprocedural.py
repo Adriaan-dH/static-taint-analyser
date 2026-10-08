@@ -238,7 +238,7 @@ class IntraproceduralTests(unittest.TestCase):
         self.add_assignment(20, "z", "IDENTIFIER", "x")
         self.set_sink_expression("IDENTIFIER", "y")
         # First visit to 10 and 7 is clean. Only a second iteration copies
-        # tainted z to y; visiting each CFG node once would return False.
+        # tainted z to y. Visiting each CFG node once would return False.
         self.assertTrue(self.analyse([(1, 10), (10, 7), (10, 20), (20, 10), (7, 5)]))
 
     def test_loop_with_clean_overwrite_converges_without_reseeding_source(self) -> None:

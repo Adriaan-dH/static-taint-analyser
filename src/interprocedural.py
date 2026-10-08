@@ -67,6 +67,8 @@ class InterproceduralAnalysis:
     def resolve(
         self, call: GraphNode, method: GraphNode, state: TaintState,
     ) -> tuple[GraphNode, ...]:
+        # Local names use their function references at this program point.
+        # Other names can resolve to a module-level function below.
         if call.value in self.local_names[method.id]:
             value = state.value(call.value)
             if (
@@ -107,7 +109,7 @@ class InterproceduralAnalysis:
         self, targets: tuple[GraphNode, ...], actuals: tuple[AbstractValue, ...],
         caller: TaintState, stack: tuple[int, ...],
     ) -> InvocationResult:
-        # Reject inconsistent arity before analysing any alternative; runtime
+        # Reject inconsistent arity before analysing any alternative. Runtime
         # argument-error paths are outside the supported abstraction.
         for target in targets:
             count = len(self.graph.method_parameters(target.id))
@@ -119,6 +121,8 @@ class InterproceduralAnalysis:
         heap = TaintState()
         sink_tainted = False
         returns = False
+        # Targets are alternatives, so each starts from the same caller state.
+        # Merge their return values and list effects after analysing each one.
         for target in targets:
             result = self.invoke(target, actuals, caller, stack)
             sink_tainted |= result.sink_tainted
@@ -140,9 +144,9 @@ class InterproceduralAnalysis:
             raise ValueError(
                 f"Call to {method.value!r}: expected {len(parameters)} arguments, got {len(actuals)}"
             )
-        # The exporter omits module definition events. Make visible module
-        # functions available as values without importing any caller locals.
+        # Each call gets fresh local bindings but retains the caller's list memory.
         entry_state = TaintState(lists=caller.lists)
+        # The exporter omits module definition events, so seed visible functions.
         for name, targets in self.top_level.items():
             if name not in self.local_names[method.id]:
                 entry_state = entry_state.bind(
@@ -217,6 +221,7 @@ class InterproceduralAnalysis:
             incoming = (
                 FlowFacts(entry_state, entry_values) if node == entry else FlowFacts(TaintState())
             )
+            # Merge facts from every predecessor already reached by the analysis.
             for predecessor in self.graph.cfg_predecessors(node.id):
                 if predecessor.id in outgoing_facts:
                     incoming = incoming.join(outgoing_facts[predecessor.id])
@@ -228,6 +233,7 @@ class InterproceduralAnalysis:
             if outgoing_facts.get(node.id) == outgoing:
                 continue
             outgoing_facts[node.id] = outgoing
+            # Changed facts revisit successors until loops reach a fixed point.
             for successor in self.graph.cfg_successors(node.id):
                 if self.graph.containing_method(successor.id) != method:
                     raise ValueError("CFG edge leaves the selected METHOD")

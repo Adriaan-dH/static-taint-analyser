@@ -7,10 +7,10 @@ from dataclasses import dataclass, replace
 class AbstractValue:
     """Scalar, list, and METHOD-reference possibilities coexist after joins."""
 
-    scalar_tainted: bool = False
-    list_objects: frozenset[int] = frozenset()
-    may_be_scalar: bool = False
-    function_methods: frozenset[int] = frozenset()
+    scalar_tainted: bool = False  # A possible scalar value carries taint.
+    list_objects: frozenset[int] = frozenset()  # Possible list allocation node IDs.
+    may_be_scalar: bool = False  # A scalar is possible, even if it is clean.
+    function_methods: frozenset[int] = frozenset()  # Possible function METHOD IDs.
 
     def join(self, other: "AbstractValue") -> "AbstractValue":
         return AbstractValue(
@@ -54,6 +54,8 @@ class ListMemory:
     def write(self, index: int | None, value: AbstractValue, strong: bool) -> "ListMemory":
         elements = dict(self.elements)
         if index is None:
+            # Any cell may be written, so keep its old value as a possibility.
+            # The summary also covers cells without an explicit entry.
             elements = {key: old.join(value) for key, old in elements.items()}
             return replace(
                 self, elements=tuple(sorted(elements.items())), unknown=self.unknown.join(value)

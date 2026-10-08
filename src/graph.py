@@ -160,7 +160,7 @@ class ProgramGraph:
         return self._require_method(method_id)
 
     def method_exit(self, method_id: int) -> GraphNode:
-        """Return the method's direct EXIT child; require exactly one."""
+        """Return the method's direct EXIT child, requiring exactly one."""
         self._require_method(method_id)
         exits = self._method_exits[method_id]
         if len(exits) != 1:
@@ -168,7 +168,7 @@ class ProgramGraph:
         return exits[0]
 
     def containing_method(self, node_id: int) -> GraphNode | None:
-        """Nearest AST METHOD, including self; None outside any method.
+        """Nearest AST METHOD, including self. Return None outside any method.
 
         A nested METHOD owns itself and its subtree, rather than belonging to
         the outer method. CFG edges do not determine ownership.
