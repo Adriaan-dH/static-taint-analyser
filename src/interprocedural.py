@@ -146,12 +146,12 @@ class InterproceduralAnalysis:
             )
         # Each call gets fresh local bindings but retains the caller's list memory.
         entry_state = TaintState(lists=caller.lists)
-        # The exporter omits module definition events, so seed visible functions.
+        # Module functions are visible until an executed definition or assignment
+        # replaces them. Parameters below also replace same-named functions.
         for name, targets in self.top_level.items():
-            if name not in self.local_names[method.id]:
-                entry_state = entry_state.bind(
-                    name, AbstractValue(function_methods=frozenset(m.id for m in targets))
-                )
+            entry_state = entry_state.bind(
+                name, AbstractValue(function_methods=frozenset(m.id for m in targets))
+            )
         for parameter, value in zip(parameters, actuals):
             entry_state = entry_state.bind(parameter.value, value)
         entry = self.graph.method_entry(method.id)

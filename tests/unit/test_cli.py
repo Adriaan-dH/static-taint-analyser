@@ -51,7 +51,7 @@ class CliTests(unittest.TestCase):
 
     def test_all_real_fixtures(self) -> None:
         cases = sorted(path for path in CASES.iterdir() if path.is_dir())
-        self.assertEqual(len(cases), 63)
+        self.assertEqual(len(cases), 66)
         for case in cases:
             with self.subTest(case=case.name):
                 expected = json.loads((case / "test_case.json").read_text())["reaches"]

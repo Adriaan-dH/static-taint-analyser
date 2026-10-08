@@ -71,6 +71,15 @@ class FixtureTests(unittest.TestCase):
     def test_nested_function_shadows_top_level(self) -> None:
         self.check_case("custom_p2_15_shadowed_function_target", False)
 
+    def test_module_call_before_nested_definition(self) -> None:
+        self.check_case("custom_p2_31_before_nested_definition_true", True)
+
+    def test_nested_call_after_definition(self) -> None:
+        self.check_case("custom_p2_32_after_nested_definition_false", False)
+
+    def test_conditional_nested_definition(self) -> None:
+        self.check_case("custom_p2_33_conditional_nested_definition_true", True)
+
     def test_part_one_fixtures_through_interprocedural_entry(self) -> None:
         expected = [True, False, True, False, True, False, True, False,
                     True, False, True, False, True, True, True, True,
@@ -602,11 +611,35 @@ class FunctionReferenceTests(unittest.TestCase):
         self.g.cfg(self.main, assignment, sink, self.exit)
         self.assertFalse(self.g.analyse(self.source, value))
 
-    def test_unassigned_local_name_does_not_fall_back_to_top_level(self) -> None:
-        # The disconnected assignment still declares a local name.
+    def test_unexecuted_assignment_preserves_top_level_function(self) -> None:
+        # A disconnected assignment cannot replace the entry binding.
         self.g.assign(self.block, "foo", self.g.node("LITERAL", "0", 2))
+        self.assertTrue(self.call_and_sink("foo"))
+
+    def test_scalar_assignment_to_module_function_prevents_fallback(self) -> None:
+        assignment = self.g.assign(self.block, "foo", self.g.node("LITERAL", "0", 2))
         with self.assertRaisesRegex(NotImplementedError, "requires function targets"):
-            self.call_and_sink("foo")
+            self.call_and_sink("foo", assignment)
+
+    def test_list_assignment_to_module_function_prevents_fallback(self) -> None:
+        literal = self.g.expression("OPERATOR", "listLiteral", self.g.node("LITERAL", "0"), order=2)
+        assignment = self.g.assign(self.block, "foo", literal)
+        with self.assertRaisesRegex(NotImplementedError, "requires function targets"):
+            self.call_and_sink("foo", literal, assignment)
+
+    def test_parameter_shadows_same_named_module_function(self) -> None:
+        method, block, exit_node, _ = self.g.method("apply", "foo", "v")
+        call = self.g.expression("CALL", "foo", self.g.node("IDENTIFIER", "v"))
+        returned = self.g.expression("RETURN", "RETURN", call)
+        self.g.ast(block, returned)
+        self.g.cfg(method, call, returned, exit_node)
+        graph = ProgramGraph(self.g.nodes, self.g.edges)
+        analysis = InterproceduralAnalysis(graph, TestMetadata(self.source, self.source))
+        function = AbstractValue(function_methods=frozenset({self.bar}))
+        result = analysis.invoke(graph.node(method), (function, TAINTED_SCALAR), TaintState(), ())
+        self.assertEqual(result.value, CLEAN_SCALAR)
+        with self.assertRaisesRegex(NotImplementedError, "requires function targets"):
+            analysis.invoke(graph.node(method), (CLEAN_SCALAR, TAINTED_SCALAR), TaintState(), ())
 
     def test_indirect_list_mutation_uses_shared_heap(self) -> None:
         method, block, exit_node, _ = self.g.method("mutate", "a", "v")
@@ -854,14 +887,98 @@ class NestedFunctionTests(unittest.TestCase):
         second = self.g.assign(self.block, "g", self.g.node("IDENTIFIER", "f", 2))
         self.assertTrue(self.call_and_sink("g", definition, first, second))
 
-    def test_call_before_definition_cannot_fall_back_to_module_function(self) -> None:
-        root, body, exit_node, _ = self.g.method("inner", "v")
+    def module_identity(self, name: str = "inner") -> int:
+        method, body, exit_node, _ = self.g.method(name, "v")
         returned = self.g.expression("RETURN", "RETURN", self.g.node("IDENTIFIER", "v"))
         self.g.ast(body, returned)
-        self.g.cfg(root, returned, exit_node)
-        self.nested(self.main, self.block, "inner", "LITERAL", "0")
+        self.g.cfg(method, returned, exit_node)
+        return method
+
+    def test_call_before_definition_resolves_module_function(self) -> None:
+        self.module_identity()
+        _, definition = self.nested(self.main, self.block, "inner", "LITERAL", "0")
+        call = self.g.expression("CALL", "inner", self.g.node("IDENTIFIER", "x"), order=2)
+        bind = self.g.assign(self.block, "y", call)
+        sink, value = self.g.sink(self.block, "y")
+        self.g.cfg(self.main, call, bind, definition, sink, self.exit)
+        self.assertTrue(self.g.analyse(self.source, value))
+
+    def test_call_after_definition_resolves_nested_function(self) -> None:
+        self.module_identity()
+        _, definition = self.nested(self.main, self.block, "inner", "LITERAL", "0")
+        self.assertFalse(self.call_and_sink("inner", definition))
+
+    def test_calls_before_and_after_definition_have_distinct_results(self) -> None:
+        self.module_identity()
+        _, definition = self.nested(self.main, self.block, "inner", "LITERAL", "0")
+        before = self.g.expression("CALL", "inner", self.g.node("IDENTIFIER", "x"), order=2)
+        first = self.g.assign(self.block, "a", before)
+        after = self.g.expression("CALL", "inner", self.g.node("IDENTIFIER", "x"), order=2)
+        second = self.g.assign(self.block, "b", after)
+        sink_a, value_a = self.g.sink(self.block, "a")
+        sink_b, value_b = self.g.sink(self.block, "b")
+        self.g.cfg(self.main, before, first, definition, after, second, sink_a, sink_b, self.exit)
+        self.assertTrue(self.g.analyse(self.source, value_a))
+        self.assertFalse(self.g.analyse(self.source, value_b))
+
+    def test_alias_after_definition_uses_nested_function(self) -> None:
+        self.module_identity()
+        _, definition = self.nested(self.main, self.block, "inner", "LITERAL", "0")
+        alias = self.g.assign(self.block, "f", self.g.node("IDENTIFIER", "inner", 2))
+        self.assertFalse(self.call_and_sink("f", definition, alias))
+
+    def test_call_before_definition_without_module_function_is_rejected(self) -> None:
+        _, definition = self.nested(self.main, self.block, "inner")
+        call = self.g.expression("CALL", "inner", self.g.node("IDENTIFIER", "x"), order=2)
+        bind = self.g.assign(self.block, "y", call)
+        sink, value = self.g.sink(self.block, "y")
+        self.g.cfg(self.main, call, bind, definition, sink, self.exit)
         with self.assertRaisesRegex(NotImplementedError, "requires function targets"):
-            self.call_and_sink("inner")
+            self.g.analyse(self.source, value)
+
+    def test_conditional_definition_joins_module_and_nested_targets(self) -> None:
+        root = self.module_identity()
+        nested, definition = self.nested(self.main, self.block, "inner", "LITERAL", "0")
+        condition = self.g.node("IDENTIFIER", "c")
+        unchanged = self.g.node("OPERATOR", "pass")
+        self.g.ast(self.block, condition, unchanged)
+        call = self.g.expression("CALL", "inner", self.g.node("IDENTIFIER", "x"), order=2)
+        bind = self.g.assign(self.block, "y", call)
+        sink, value = self.g.sink(self.block, "y")
+        self.g.cfg(self.main, condition, definition, call, bind, sink, self.exit)
+        self.g.cfg(condition, unchanged, call)
+        graph = ProgramGraph(self.g.nodes, self.g.edges)
+        analysis = InterproceduralAnalysis(graph, TestMetadata(self.source, value))
+        incoming, _, _ = analysis.solve(
+            graph.node(self.main), TaintState().bind("x", TAINTED_SCALAR).bind(
+                "inner", AbstractValue(function_methods=frozenset({root}))
+            ), (self.main,),
+        )
+        self.assertEqual(incoming[call].state.value("inner").function_methods, frozenset({root, nested}))
+        self.assertTrue(self.g.analyse(self.source, value))
+
+    def test_definition_in_loop_joins_entry_and_back_edge_targets(self) -> None:
+        root, body, exit_node, _ = self.g.method("inner", "v")
+        returned = self.g.expression("RETURN", "RETURN", self.g.node("LITERAL", "0"))
+        self.g.ast(body, returned)
+        self.g.cfg(root, returned, exit_node)
+        nested, definition = self.nested(self.main, self.block, "inner")
+        condition = self.g.node("IDENTIFIER", "c")
+        self.g.ast(self.block, condition)
+        call = self.g.expression("CALL", "inner", self.g.node("IDENTIFIER", "x"), order=2)
+        bind = self.g.assign(self.block, "y", call)
+        sink, value = self.g.sink(self.block, "y")
+        self.g.cfg(self.main, call, bind, definition, condition, call)
+        self.g.cfg(condition, sink, self.exit)
+        graph = ProgramGraph(self.g.nodes, self.g.edges)
+        analysis = InterproceduralAnalysis(graph, TestMetadata(self.source, value))
+        incoming, _, _ = analysis.solve(
+            graph.node(self.main), TaintState().bind("x", TAINTED_SCALAR).bind(
+                "inner", AbstractValue(function_methods=frozenset({root}))
+            ), (self.main,),
+        )
+        self.assertEqual(incoming[call].state.value("inner").function_methods, frozenset({root, nested}))
+        self.assertTrue(self.g.analyse(self.source, value))
 
     def test_same_name_nested_and_module_methods_keep_distinct_ids(self) -> None:
         root, _, root_exit, _ = self.g.method("f", "v")
