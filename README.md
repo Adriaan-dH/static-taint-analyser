@@ -60,7 +60,7 @@ Observed through `./main -i <directory>`:
 | test_inter4 | false | false | Pass |
 | test_inter5 | true | true | Pass |
 
-All 63 test fixtures passed through the CLI, each completing in under 5 seconds
+All 66 test fixtures passed through the CLI, each completing in under 5 seconds
 on the validation machine. Run the regression suite with:
 
 ```bash
@@ -74,6 +74,3 @@ python3 -B -m unittest discover -s tests/unit -v
 - Recursive/cyclic calls and ambiguous nested `METHOD_REF` resolution currently
   raise `NotImplementedError`.
 - Sources must currently be direct method `PARAMETER` nodes.
-- Known resolution concern: a call before a same-named nested function definition
-  may treat the name as local throughout the method, preventing resolution to a
-  module-level function.
